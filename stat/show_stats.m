@@ -1,5 +1,5 @@
 stat_all = read_stats;
-stat_lt600 = stat(stat < 600);
+stat_lt600 = stat_all(stat_all < 600);
 stat_le96  = stat_lt600(stat_lt600 <= 96);
 sstat_eq1  = sum(stat_le96 == 1);
 sstat_eq2  = sum(stat_le96 == 2);
