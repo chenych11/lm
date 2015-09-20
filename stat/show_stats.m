@@ -21,6 +21,7 @@ fprintf('percentage of length above 64: %.2f%%\n', 100*double(sstat_gt64)/length
 fprintf('percentage of length 3 to 96: %.2f%%\n', 100*double(length(stat_3t96))/length(stat_all));
 fprintf('percentage of length 3 to 8: %.2f%%\n', 100*double(sstat_3t8)/length(stat_all));
 fprintf('percentage of length above 80: %.2f%%\n', 100*double(sstat_9t12)/length(stat_all));
+fprintf('percentage of length 3 to 64: %.2f%%\n', 100*double(length(stat_3t64))/length(stat_all));
 
 figure;
 hist(stat_all, 1:2500);

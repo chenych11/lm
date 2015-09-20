@@ -12,6 +12,7 @@ import logging
 __author__ = 'Yunchuan Chen'
 logging.basicConfig(level=logging.INFO)
 
+
 class ReadFileTest(unittest.TestCase):
     def test_prprcs_wrt(self):
         if not os.path.exists('../data/corpus/wiki-sg-norm-lc-drop.bz2'):
@@ -155,7 +156,13 @@ def binarize_corpus(group_size=20000, corpus_file='../data/corpus/wiki-sg-norm-l
 
     dist_file = smart_open(dist_file, 'wb')
     assert dist_file is not None
-    wp = import_wordmap(fname=wordmap)
+    if isinstance(wordmap, str):
+        wp = import_wordmap(fname=wordmap)
+    elif isinstance(wordmap, dict):
+        wp = wordmap
+    else:
+        logging.error('can not recognize wordmap type')
+        raise TypeError('wordamp must be dict or str')
     word2idx = wp['word2idx']
     result = [[] for _ in range(max_len + 1)]
     with smart_open(corpus_file) as f:
