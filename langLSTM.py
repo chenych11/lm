@@ -9,6 +9,8 @@ from keras import activations, initializations
 from keras.layers.recurrent import Recurrent
 from keras.layers.core import MaskedLayer
 import numpy as np
+import os
+import re
 # from keras.layers.core import MaskedLayer, Layer
 
 
@@ -744,6 +746,9 @@ class LangLSTMLayer(Recurrent):
         # c_t = mask * c_t_cndt + (1-mask) * c_tm1
         return h_t, c_t
 
+    def get_output_mask(self, train=None):
+        return None
+
     def _get_output_with_mask(self, train=False):
         X = self.get_input(train)
         # mask = self.get_padded_shuffled_mask(train, X, pad=0)
@@ -828,6 +833,42 @@ class LangLSTMLayer(Recurrent):
                 "input_activation": self.input_activation.__name__,
                 "gate_activation": self.gate_activation.__name__,
                 "truncate_gradient": self.truncate_gradient}
+
+from keras.models import Sequential
+from keras.layers.embeddings import Embedding
+from keras.layers.core import Dropout, Dense, Activation
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('LangModel')
+
+
+class LangModel(object):
+    def __init__(self, vocab_size, embed_dim=128, lstm_outdim=128):
+        self.model = Sequential()
+        self.model.add(Embedding(input_dim=vocab_size, output_dim=embed_dim))
+        self.model.add(LangLSTMLayer(input_dim=embed_dim, output_dim=lstm_outdim))
+        self.model.add(Dropout(0.5))
+        self.model.add(Dense(input_dim=lstm_outdim, output_dim=vocab_size, activation='softmax'))
+        self.model.compile(loss='categorical_crossentropy', optimizer='adam', class_mode='categorical')
+
+    def train(self, X, y, nb_epoch=1, *args, **kwargs):
+        self.model.fit(X, y, nb_epoch=nb_epoch, *args, **kwargs)
+
+    def train_from_dir(self, dir_, data_regex=re.compile(r'\d{3}.bz2'), *args, **kwargs):
+        train_files_ = [os.path.join(dir_, f) for f in os.listdir(dir_) if data_regex.match(f)]
+        train_files = [f for f in train_files_ if os.path.isfile(f)]
+
+        for f in train_files:
+            X = np.loadtxt(f)
+            y = np.zeros((X.shape[0], X.shape[1], 15), dtype=np.int8)
+
+            for i in range(X.shape[0]):
+                for j in range(X.shape[1]):
+                    idx = X[i, j]
+                    y[i, j, idx] = 1
+            logger.info('training on %s' % f)
+            self.train(X, y, *args, **kwargs)
+
 
 
 if __name__ == '__main__':
