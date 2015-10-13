@@ -3,6 +3,7 @@ data
 stat/*.fig
 stat/*.jpg
 .idea
+.ipynb_checkpoints
 # Created by .ignore support plugin (hsz.mobi)
 ### Matlab template
 ##---------------------------------------------------
