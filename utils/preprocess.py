@@ -8,6 +8,7 @@ import os
 import numpy as np
 import cPickle as pickle
 import logging
+import re
 
 __author__ = 'Yunchuan Chen'
 logging.basicConfig(level=logging.INFO)
@@ -214,6 +215,31 @@ def show_grouped_sentences(group_sents, wordmap='../data/wiki-wordmap.wp'):
     ret = [None] * group_sents.shape[0]
     for i in range(len(ret)):
         ret[i] = [idx2word[j] for j in group_sents[i]]
+
+    return ret
+
+
+def get_fake_data_meta(fname='../data/fake', trn_regex=re.compile(r'\d{3}.bz2')):
+    data_path = os.path.abspath(fname)
+    meta_file = os.path.join(data_path, 'meta.pkl')
+    if not os.path.isfile(meta_file):
+        train_files_ = [os.path.join(data_path, f) for f in os.listdir(data_path) if trn_regex.match(f)]
+        train_files = [f for f in train_files_ if os.path.isfile(f)]
+        nb_total = 0
+        nb_bin = np.zeros((15,), dtype='int32')
+
+        for f in train_files:
+            X = np.loadtxt(f, dtype='int32')
+            nb_bin += np.bincount(X.ravel(), minlength=15)
+            nb_total += np.prod(X.shape)
+
+        rel_freq = nb_bin.astype('float32')/nb_total
+        ret = {'freq': nb_bin, 'rel_freq': rel_freq, 'nb_total': nb_total}
+        with file(meta_file, 'wb') as mf:
+            pickle.dump(ret, mf)
+    else:
+        with file(meta_file, 'rb') as mf:
+            ret = pickle.load(mf)
 
     return ret
 

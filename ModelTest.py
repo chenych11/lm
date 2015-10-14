@@ -29,9 +29,11 @@ parser.add_option("-t", "--test",
 parser.add_option("-d", "--debug",
                   action="store_true", dest="debug", default=False,
                   help="show debug information")
+parser.add_option("-g", "--unigram",
+                  action="store_true", dest="unigram", default=False,
+                  help="Whether use unigram distribution for noise samples")
 
 options, args = parser.parse_args()
-
 # ====================================================================================
 # if TESTLM environment variable is defined, run the program on a small data set.
 if os.environ.get('TESTLM') is not None or options.test:
@@ -45,6 +47,14 @@ if options.debug:
 else:
     logging.basicConfig(level=logging.INFO)
 
+if options.unigram:
+    import cPickle as pickle
+    with file(os.path.join(data_path, 'meta.pkl'), 'rb') as mf:
+        meta = pickle.load(mf)
+        negprob_table = meta['rel_freq']
+else:
+    negprob_table = None
+
 if options.train_simple:
     logging.info('Train simple language model')
     model = SimpleLangModel(vocab_size=15)
@@ -57,14 +67,14 @@ if options.train_simple:
 
 if options.train_nce:
     logging.info('Train NCE based language model')
-    model = NCELangModel(vocab_size=15, nb_negative=2, embed_dims=128)
+    model = NCELangModel(vocab_size=15, nb_negative=2, embed_dims=128, negprob_table=negprob_table)
     model.compile()
     logging.debug('compile success')
     model.train_from_dir(data_path, validation_split=0.05, batch_size=options.batch_size, verbose=options.verbose)
 
 if options.train_nce1:
     logging.info('Train NCE based language model (1)')
-    model = NCELangModelV1(vocab_size=15, nb_negative=2, embed_dims=128)
+    model = NCELangModelV1(vocab_size=15, nb_negative=2, embed_dims=128, negprob_table=negprob_table)
     model.compile()
     logging.debug('compile success')
     model.train_from_dir(data_path, validation_split=0.05, batch_size=options.batch_size, verbose=options.verbose)

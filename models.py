@@ -680,6 +680,9 @@ class NCELangModel(Graph):
             negprob_table_ = np.ones(shape=(vocab_size,), dtype=theano.config.floatX)/vocab_size
             negprob_table = theano.shared(negprob_table_)
             self.neg_prob_table = negprob_table_
+        else:
+            self.neg_prob_table = negprob_table.astype(theano.config.floatX)
+            negprob_table = theano.shared(negprob_table.astype(theano.config.floatX))
 
         self.sampler = TableSampler(self.neg_prob_table)
 
@@ -1003,6 +1006,8 @@ class NCELangModelV1(Graph):
 
         if negprob_table is None:
             self.neg_prob_table = np.ones(shape=(vocab_size,), dtype=theano.config.floatX)/vocab_size
+        else:
+            self.neg_prob_table = negprob_table.astype(theano.config.floatX)
         self.sampler = TableSampler(self.neg_prob_table)
 
         self.add_input(name='pos_sents', ndim=2, dtype='int32')
