@@ -25,7 +25,7 @@ import re
 import math
 
 logger = logging.getLogger('lm.models')
-
+floatX = theano.config.floatX
 
 class LangHistory(History):
 
@@ -293,7 +293,7 @@ class LangLSTMLayer(Recurrent):
             allow_gc=theano.config.scan.allow_gc)
 
         res = T.concatenate([h0.dimshuffle('x', 0, 1), outputs], axis=0).dimshuffle((1, 0, 2))
-        return res[:, :-1, :]  # drop the last frame
+        return res
 
     def _get_output_without_mask(self, train=False):
         X = self.get_input(train)
@@ -356,6 +356,33 @@ class LangLSTMLayer(Recurrent):
                 "input_activation": self.input_activation.__name__,
                 "gate_activation": self.gate_activation.__name__,
                 "truncate_gradient": self.truncate_gradient}
+
+
+class LangModel(object):
+    def __init__(self):
+        super(LangModel, self).__init__()
+
+    @staticmethod
+    def encode_length(y_label, y_pred, mask=None):
+        # probs_ = T.sum(y_true * y_pred, axis=-1)
+        # TODO: it may be very slow when the vocabulary is very large.
+        # probs_ = y_pred[y_true.nonzero()]
+        # y_label = T.flatten(y_label)
+        # y_pred = T.reshape(y_pred, (-1, y_pred.shape[-1]))
+        nb_rows = y_label.shape[0]
+        nb_cols = y_label.shape[1]
+        row_idx = T.reshape(T.arange(nb_rows), (nb_rows, 1))
+        col_idx = T.reshape(T.arange(nb_cols), (1, nb_cols))
+        probs_ = y_pred[row_idx, col_idx, y_label]
+
+        if mask is None:
+            nb_words = nb_rows * nb_cols
+            probs = probs_.ravel() + 1.0e-37
+        else:
+            nb_words = mask.sum()
+            probs = T.reshape(probs_, mask.shape)[mask.nonzero()] + 1.0e-37
+
+        return T.sum(T.log(1.0/probs)), nb_words
 
 
 class SimpleLangModel(Sequential):
@@ -428,7 +455,10 @@ class SimpleLangModel(Sequential):
             self.train(X, y, callbacks, show_metrics, *args, **kwargs)
 
     # noinspection PyMethodOverriding
-    def compile(self):
+    def compile(self, optimizer=None):
+        if optimizer is not None:
+            logger.info('compiling with %s' % optimizer)
+            self.optimizer = optimizers.get(optimizer)
         # input of model
         self.X_train = self.get_input(train=True)
         self.X_test = self.get_input(train=False)
@@ -693,7 +723,7 @@ class NCELangModel(Graph):
         seq.add(self.nodes['pos_sents'])
         seq.add(Embedding(vocab_size, embed_dims))
         seq.add(LangLSTMLayer(embed_dims, output_dim=128))
-        seq.add(Dropout(0.5))
+        # seq.add(Dropout(0.5))
 
         self.add_node(seq, name='seq')
         self.add_node(PartialSoftmax(input_dim=128, output_dim=vocab_size),
@@ -710,6 +740,7 @@ class NCELangModel(Graph):
         self.add_output('neg_prob', node='lookup_prob')
         self.add_output('pred_prob', node='true_prob')
 
+        # TODO: this is memory inefficiency for larg vocabulary
         self.word_labels = theano.shared(np.eye(vocab_size, dtype='int32'), borrow=True)
 
     @staticmethod
@@ -728,8 +759,9 @@ class NCELangModel(Graph):
 
     # noinspection PyMethodOverriding
     def compile(self, optimizer=None, theano_mode=None):
-        if optimizer is None:
-            optimizer = self.optimizer
+        if optimizer is not None:
+            logger.info('compiling with %s' % optimizer)
+            self.optimizer = optimizers.get(optimizer)
 
         pos_prob_layer = self.outputs['pos_prob']
         neg_prob_layer = self.outputs['neg_prob']
@@ -742,6 +774,7 @@ class NCELangModel(Graph):
         pre_prob_tst = pre_prob_layer.get_output(train=False)
 
         eps = 1.0e-37
+        #TODO: mask not supported here
         nb_words = pos_prob_trn[0].size.astype(theano.config.floatX)
         y_train = T.sum(T.log(eps + pos_prob_trn[0] / (pos_prob_trn[0] + neg_prob_trn[0]))) / nb_words
         y_train += T.sum(T.log(eps + neg_prob_trn[1:] / (pos_prob_trn[1:] + neg_prob_trn[1:]))) / nb_words
@@ -755,7 +788,6 @@ class NCELangModel(Graph):
         test_loss = -y_test
         for r in self.regularizers:
             train_loss = r(train_loss)
-        self.optimizer = optimizers.get(optimizer)
         updates = self.optimizer.get_updates(self.params, self.constraints, train_loss)
         updates += self.updates
 
@@ -1019,7 +1051,7 @@ class NCELangModelV1(Graph):
         seq.add(self.inputs['pos_sents'])
         seq.add(Embedding(vocab_size, embed_dims))
         seq.add(LangLSTMLayer(embed_dims, output_dim=128))
-        seq.add(Dropout(0.5))
+        # seq.add(Dropout(0.5))
 
         self.add_node(seq, name='seq')
 
@@ -1062,8 +1094,9 @@ class NCELangModelV1(Graph):
 
     # noinspection PyMethodOverriding
     def compile(self, optimizer=None, theano_mode=None):
-        if optimizer is None:
-            optimizer = self.optimizer
+        if optimizer is not None:
+            logger.info('compiling with %s' % optimizer)
+            self.optimizer = optimizers.get(optimizer)
 
         pos_prob_layer = self.outputs['pos_prob']
         neg_prob_layer = self.outputs['neg_prob']
@@ -1076,6 +1109,7 @@ class NCELangModelV1(Graph):
         pre_prob_tst = pre_prob_layer.get_output(train=False)
 
         eps = 1.0e-37
+        #TODO: mask not supported here
         nb_words = pos_prob_trn[0].size.astype(theano.config.floatX)
         y_train = T.sum(T.log(eps + pos_prob_trn[0] / (pos_prob_trn[0] + neg_prob_trn[0]))) / nb_words
         y_train += T.sum(T.log(eps + neg_prob_trn[1:] / (pos_prob_trn[1:] + neg_prob_trn[1:]))) / nb_words
@@ -1089,7 +1123,6 @@ class NCELangModelV1(Graph):
         # test_loss = -y_test
         for r in self.regularizers:
             train_loss = r(train_loss)
-        self.optimizer = optimizers.get(optimizer)
         updates = self.optimizer.get_updates(self.params, self.constraints, train_loss)
         updates += self.updates
 
@@ -1272,6 +1305,218 @@ class NCELangModelV1(Graph):
 
         outs = f.summarize_outputs(outs, batch_info)
         return outs
+
+
+class TreeLogSoftmax(Embedding, MultiInputLayer):
+    eps = 10e-37
+
+    def __init__(self, input_dim, embed_dim, init='uniform', W_regularizer=None,
+                 activity_regularizer=None, W_constraint=None, weights=None):
+        # The order to call base __init__ functions is important
+        Embedding.__init__(self, input_dim, output_dim=embed_dim, init=init,
+                           W_regularizer=W_regularizer, activity_regularizer=activity_regularizer,
+                           W_constraint=W_constraint, mask_zero=False, weights=weights)
+        # self.b = theano.shared(np.zeros(input_dim, dtype=floatX), borrow=True)
+        # self.params.append(self.b)
+        MultiInputLayer.__init__(self, slot_names=('features', 'cls_idx', 'word_bitstr_mask'))
+
+    def supports_masked_input(self):
+        return True
+
+    def get_output_mask(self, train=None):
+        self.name2layer['features'].get_output_mask(train=train)
+
+    def get_output(self, train=False):
+        ins = self.get_input(train=train)
+        features = ins['features']
+        cls_idx = ins['cls_idx']
+        word_bits_mask = ins['word_bitstr_mask']
+
+        node_embeds = self.W[cls_idx]                           # (n_s, n_t, n_n, d_l)
+        # node_bias = self.b[cls_idx]                           # (n_s, n_t, n_n)
+        features = features.dimshuffle(0, 1, 'x', 2)            # (n_s, n_t, 1,   d_l)
+        # score = T.sum(features * node_embeds, axis=-1) + node_bias         # (n_s, n_t, n_n)
+        score = T.sum(features * node_embeds, axis=-1)          # (n_s, n_t, n_n)
+        prob_ = T.nnet.sigmoid(score * word_bits_mask)          # (n_s, n_t, n_n)
+        prob = T.switch(T.eq(word_bits_mask, 0.0), 1.0, prob_)  # (n_s, n_t, n_n)
+        log_prob = T.sum(T.log(self.eps+prob), axis=-1)         # (n_s, n_t)
+        return log_prob
+
+    def get_config(self):
+        return {"name": self.__class__.__name__,
+                "input_dim": self.input_dim,
+                "output_dim": self.output_dim,
+                "input_slot_names": self.input_layer_names,
+                "init": self.init.__name__,
+                "activity_regularizer": self.activity_regularizer.get_config() if self.activity_regularizer else None,
+                "W_regularizer": self.W_regularizer.get_config() if self.W_regularizer else None,
+                "W_constraint": self.W_constraint.get_config() if self.W_constraint else None}
+
+
+class NotLinkedError(Exception):
+    def __init__(self, message):
+        super(NotLinkedError, self).__init__(message)
+        # self.message = message
+
+
+class TreeLangModel(Graph, LangModel):
+    def __init__(self, vocab_size, embed_dim, cntx_dim, word2class, word2bitstr, optimizer='adam'):
+        super(TreeLangModel, self).__init__()
+
+        self.add_input('cls_idx', ndim=3, dtype='int32')
+        self.add_input('word_bitstr_mask', ndim=3, dtype=floatX)
+        self.add_input('word_idx', ndim=2, dtype='int32')
+
+        seq = containers.Sequential()
+        seq.add(Embedding(vocab_size, output_dim=embed_dim))
+        seq.add(LangLSTMLayer(embed_dim, output_dim=cntx_dim))
+        # seq.add(Dense(input_dim=cntx_dim, output_dim=cntx_dim, activation='sigmoid'))
+        # seq.add(Dropout(0.5))
+
+        self.add_node(seq, name='seq', inputs='word_idx')
+        self.add_node(TreeLogSoftmax(vocab_size, embed_dim=cntx_dim), name='tree_softmax',
+                      inputs=('seq', 'cls_idx', 'word_bitstr_mask'))
+
+        self.add_output('tree_softmax', 'tree_softmax')
+        self.add_output('true_labels', 'word_idx')
+
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.context_dim = cntx_dim
+        self.optimizer = optimizers.get(optimizer)
+        self.word2class = word2class
+        self.word2bitstr = word2bitstr
+
+    @staticmethod
+    def encode_length(y_label, y_pred_log, mask=None):
+        if mask is None:
+            nb_words = y_label.shape[0] * y_label.shape[1]
+            log_probs = y_pred_log.ravel() + 1.0e-37
+        else:
+            nb_words = mask.sum()
+            log_probs = y_pred_log[mask.nonzero()] + 1.0e-37
+
+        return -T.sum(log_probs), nb_words
+
+    # noinspection PyMethodOverriding
+    def compile(self, optimizer=None, theano_mode=None):
+        if optimizer is not None:
+            logger.info('compiling with %s' % optimizer)
+            self.optimizer = optimizers.get(optimizer)
+
+        logprob_layer = self.outputs['tree_softmax']
+        logprob_trn = logprob_layer.get_output(train=True)
+        logprob_tst = logprob_layer.get_output(train=False)
+
+        # eps = 1.0e-37
+        #TODO: mask not supported here
+        nb_words = logprob_trn.size.astype(theano.config.floatX)
+        train_loss = -T.sum(logprob_trn) / nb_words
+        test_loss = -T.sum(logprob_tst) / nb_words
+
+        true_labels = self.outputs['true_labels'].get_output(train=True)
+        #TODO: mask not supported here
+        encode_len, nb_words = self.encode_length(true_labels, logprob_tst)
+
+        for r in self.regularizers:
+            train_loss = r(train_loss)
+        updates = self.optimizer.get_updates(self.params, self.constraints, train_loss)
+        updates += self.updates
+
+        train_inputs = [self.inputs['word_idx'].get_output(True),
+                        self.inputs['cls_idx'].get_output(True),
+                        self.inputs['word_bitstr_mask'].get_output(True)]
+        test_inputs = [self.inputs['word_idx'].get_output(False),
+                       self.inputs['cls_idx'].get_output(False),
+                       self.inputs['word_bitstr_mask'].get_output(False)]
+
+        self._train = theano.function(train_inputs, outputs=[train_loss], updates=updates, mode=theano_mode)
+        self._test = theano.function(test_inputs, outputs=[test_loss, encode_len, nb_words], mode=theano_mode)
+
+        self._train.out_labels = ('loss', )
+        self._test.out_labels = ('loss', 'encode_len', 'nb_words')
+        self.all_metrics = ['loss', 'val_loss', 'val_ppl']
+
+        def __summarize_outputs(outs, batch_sizes):
+            """
+                :param outs: outputs of the _test* function. It is a list, and each element a list of
+                values of the outputs of the _test* function on corresponding batch.
+                :type outs: list
+                :param batch_sizes: batch sizes. A list with the same length with outs. Each element
+                is a size of corresponding batch.
+                :type batch_sizes: list
+                Aggregate outputs of batches as if the test function evaluates
+                the metric values on the union of the batches.
+                Note this function must be redefined for each specific problem
+            """
+            out = np.array(outs, dtype=theano.config.floatX)
+            loss, encode_len, nb_words = out
+            batch_size = np.array(batch_sizes, dtype=theano.config.floatX)
+
+            smry_loss = np.sum(loss * batch_size)/batch_size.sum()
+            smry_encode_len = encode_len.sum()
+            smry_nb_words = nb_words.sum()
+            return [smry_loss, smry_encode_len, smry_nb_words]
+
+        self._test.summarize_outputs = __summarize_outputs
+
+    def prepare_input(self, X, validation_split, validation_data):
+        ins = [None, None, None]
+        val_ins = [None, None, None]
+        if validation_data:
+            ins[0] = X
+            val_ins[0] = validation_data
+        elif 0 < validation_split < 1:
+            split_at = max(int(X.shape[0] * (1 - validation_split)), 1)
+            ins[0], val_ins[0] = X[:split_at], X[split_at:]
+        else:
+            ins[0] = X
+            val_ins[0] = None
+
+        ins[1] = self.word2class[ins[0]]
+        ins[2] = self.word2bitstr[ins[0]]
+        if val_ins[0] is not None:
+            val_ins[1] = self.word2class[val_ins[0]]
+            val_ins[2] = self.word2bitstr[val_ins[0]]
+
+        return ins, val_ins
+
+    def train(self, X, callbacks, show_metrics, batch_size=128, extra_callbacks=None,
+              validation_split=0., validation_data=None, shuffle=False, verbose=1, **kwargs):
+
+        val_f = None
+        ins, val_ins = self.prepare_input(X, validation_split, validation_data)
+
+        if val_ins[0] is not None:
+            val_f = self._test
+        else:
+            val_ins = None
+
+        f = self._train
+        return self._fit(f, ins, callbacks, val_f=val_f, val_ins=val_ins, metrics=show_metrics,
+                         batch_size=batch_size, nb_epoch=1, extra_callbacks=extra_callbacks,
+                         shuffle=shuffle, verbose=verbose)
+
+    def train_from_dir(self, dir_, trn_regex=re.compile(r'\d{3}.bz2'), tst_regex=re.compile(r'test.bz2'),
+                       callbacks=LangHistory(), show_metrics=('loss', 'ppl'),
+                       extra_callbacks=(LangModelLogger(), ), chunk_size=35000, **kwargs):
+        train_files_ = [os.path.join(dir_, f) for f in os.listdir(dir_) if trn_regex.match(f)]
+        train_files = [f for f in train_files_ if os.path.isfile(f)]
+        # test_files_ = [os.path.join(dir_, f) for f in os.listdir(dir_) if tst_regex.match(f)]
+        # test_files = [f for f in test_files_ if os.path.isfile(f)]
+
+        for f in train_files:
+            logger.info('Loading training data from %s' % f)
+            X = np.loadtxt(f, dtype='int32')
+            nb_samples = X.shape[0]
+            logger.debug('%d samples loaded' % nb_samples)
+            logger.info('Training on %s' % f)
+            chunks = make_batches(nb_samples, chunk_size)
+            nb_chunks = len(chunks)
+            for chunk_id, (batch_start, batch_end) in enumerate(chunks):
+                data = slice_X([X], batch_start, batch_end, axis=0)[0]
+                print 'Chunk %d/%d' % (chunk_id+1, nb_chunks)
+                self.train(data, callbacks, show_metrics, extra_callbacks=extra_callbacks, **kwargs)
 
 
 def slice_X(X, start_, end_=None, axis=1):
