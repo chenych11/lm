@@ -386,7 +386,7 @@ class LangModel(object):
 
 
 class SimpleLangModel(Sequential):
-    def __init__(self, vocab_size, embed_dims=128, loss='categorical_crossentropy', optimizer='adam'):
+    def __init__(self, vocab_size, embed_dims=128, context_dims=128, loss='categorical_crossentropy', optimizer='adam'):
         super(SimpleLangModel, self).__init__()
         self.vocab_size = vocab_size
         self.embed_dim = embed_dims
@@ -394,12 +394,11 @@ class SimpleLangModel(Sequential):
         self.optimizer = optimizers.get(optimizer)
         self.loss = objectives.get(loss)
         self.loss_fnc = objective_fnc(self.loss)
-        # self.model = Sequential()
-        # self.model.add(Embedding(input_dim=vocab_size, output_dim=embed_dim))
-        # self.model.add(LangLSTMLayer(input_dim=embed_dim, output_dim=lstm_outdim))
-        # self.model.add(Dropout(0.5))
-        # self.model.add(Dense(input_dim=lstm_outdim, output_dim=vocab_size, activation='softmax'))
-        # self.model.compile(loss='categorical_crossentropy', optimizer='adam', class_mode='categorical')
+
+        self.add(Embedding(input_dim=vocab_size, output_dim=embed_dims))
+        self.add(LangLSTMLayer(input_dim=embed_dims, output_dim=context_dims))
+        # self.add(Dropout(0.5))
+        self.add(Dense(input_dim=context_dims, output_dim=vocab_size, activation='softmax'))
 
     @staticmethod
     def encode_length(y_true, y_pred, mask):
@@ -562,7 +561,7 @@ class SimpleLangModel(Sequential):
         self._train.summarize_outputs = __summary_outputs
         self._test.summarize_outputs = __summary_outputs
         # self._test_with_acc.summary_outputs = __summary_outputs
-
+        # noinspection PyUnresolvedReferences
         self.fit = self._Sequential__fit_unweighted
 
 
@@ -592,7 +591,7 @@ class Split(LayerList):
         self.output_layer_names = slot_names
         self.input_layer_names = ['whole']
         self.__output_slots = []
-        self.keep_dim = keep_dim or (split_at > 1)
+        self.keep_dim = keep_dim or (abs(split_at) > 1)
 
         # if broadcastable is None:
         #     broadcastable = ((), ())
@@ -781,18 +780,21 @@ class NCELangModel(Graph):
         pre_prob_layer = self.outputs['pred_prob']
 
         pos_prob_trn = pos_prob_layer.get_output(train=True)
-        neg_prob_trn = neg_prob_layer.get_output(train=True)
+        neg_prob_trn = neg_prob_layer.get_output(train=True) * self.nb_negative
         pos_prob_tst = pos_prob_layer.get_output(train=False)
-        neg_prob_tst = neg_prob_layer.get_output(train=False)
+        neg_prob_tst = neg_prob_layer.get_output(train=False) * self.nb_negative
         pre_prob_tst = pre_prob_layer.get_output(train=False)
 
         eps = 1.0e-37
         #TODO: mask not supported here
         nb_words = pos_prob_trn[0].size.astype(theano.config.floatX)
-        y_train = T.sum(T.log(eps + pos_prob_trn[0] / (pos_prob_trn[0] + neg_prob_trn[0]))) / nb_words
-        y_train += T.sum(T.log(eps + neg_prob_trn[1:] / (pos_prob_trn[1:] + neg_prob_trn[1:]))) / nb_words
-        y_test = T.sum(T.log(eps + pos_prob_tst[0] / (pos_prob_trn[0] + neg_prob_tst[0]))) / nb_words
-        y_test += T.sum(T.log(eps + neg_prob_tst[1:] / (pos_prob_trn[1:] + neg_prob_tst[1:]))) / nb_words
+        sum_pos_neg_trn = pos_prob_trn + neg_prob_trn
+        sum_pos_neg_tst = pos_prob_tst + neg_prob_tst
+
+        y_train = T.sum(T.log(eps + pos_prob_trn[0] / sum_pos_neg_trn[0])) / nb_words
+        y_train += T.sum(T.log(eps + neg_prob_trn[1:] / sum_pos_neg_trn[1:])) / nb_words
+        y_test = T.sum(T.log(eps + pos_prob_tst[0] / sum_pos_neg_tst[0])) / nb_words
+        y_test += T.sum(T.log(eps + neg_prob_tst[1:] / sum_pos_neg_tst[1:])) / nb_words
 
         true_labels = self.word_labels[self.inputs['idxes'].get_output()[0]]
         encode_len, nb_words = self.encode_length(true_labels, pre_prob_tst)
@@ -1116,18 +1118,19 @@ class NCELangModelV1(Graph):
         pre_prob_layer = self.outputs['pred_prob']
 
         pos_prob_trn = pos_prob_layer.get_output(train=True)
-        neg_prob_trn = neg_prob_layer.get_output(train=True)
+        neg_prob_trn = neg_prob_layer.get_output(train=True) * self.nb_negative
         # pos_prob_tst = pos_prob_layer.get_output(train=False)
-        # neg_prob_tst = neg_prob_layer.get_output(train=False)
+        # neg_prob_tst = neg_prob_layer.get_output(train=False) * self.nb_negative
         pre_prob_tst = pre_prob_layer.get_output(train=False)
 
         eps = 1.0e-37
         #TODO: mask not supported here
         nb_words = pos_prob_trn[0].size.astype(theano.config.floatX)
-        y_train = T.sum(T.log(eps + pos_prob_trn[0] / (pos_prob_trn[0] + neg_prob_trn[0]))) / nb_words
-        y_train += T.sum(T.log(eps + neg_prob_trn[1:] / (pos_prob_trn[1:] + neg_prob_trn[1:]))) / nb_words
-        # y_test = T.sum(T.log(eps + pos_prob_tst[0] / (pos_prob_trn[0] + neg_prob_tst[0]))) / nb_words
-        # y_test += T.sum(T.log(eps + neg_prob_tst[1:] / (pos_prob_trn[1:] + neg_prob_tst[1:]))) / nb_words
+        sum_pos_neg_trn = pos_prob_trn + neg_prob_trn
+        y_train = T.sum(T.log(eps + pos_prob_trn[0] / sum_pos_neg_trn[0])) / nb_words
+        y_train += T.sum(T.log(eps + neg_prob_trn[1:] / sum_pos_neg_trn[1:])) / nb_words
+        # y_test = T.sum(T.log(eps + pos_prob_tst[0] / (pos_prob_tst[0] + neg_prob_tst[0]))) / nb_words
+        # y_test += T.sum(T.log(eps + neg_prob_tst[1:] / (pos_prob_tst[1:] + neg_prob_tst[1:]))) / nb_words
 
         true_labels = self.inputs['pos_sents'].get_output()
         encode_len, nb_words = self.encode_length(true_labels, pre_prob_tst)
@@ -2008,10 +2011,20 @@ class LBLangModelV1(Graph):
         self.add_node(Embedding(vocab_size+context_size, embed_dims), name='embedding', inputs='ngrams')
         self.add_node(EmbeddingParam(), name='embedding_param', inputs='embedding')
         self.add_node(Reshape(-1), name='reshape', inputs='embedding')
-        self.add_node(Dense(context_size*embed_dims, embed_dims), name='context_vec', inputs='reshape')
+        composer_node = Dense(context_size*embed_dims, embed_dims)
+        composer_node.params = [composer_node.W]   # drop the bias parameters
+        # del composer_node.b
+        # replace the default behavior of Dense
+        composer_node.get_output = lambda train: node_get_output(composer_node, train)
+        self.add_node(composer_node, name='context_vec', inputs='reshape')
         self.add_node(LBLScoreV1(vocab_size), name='score', inputs=('context_vec', 'embedding_param'))
 
         self.add_output('prob', 'score')
+
+        def node_get_output(layer, train=False):
+            X = layer.get_input(train)
+            output = layer.activation(T.dot(X, layer.W))
+            return output
 
     @staticmethod
     def encode_length(y_true, y_pred, mask=None):
@@ -2178,6 +2191,1133 @@ class LBLangModelV1(Graph):
             #         y[i, j, idx] = 1
             logger.info('Training on %s' % f)
             self.train(X, y, callbacks, show_metrics, *args, **kwargs)
+
+
+class FFNNLangModelV1(Graph):
+    def __init__(self, vocab_size, context_size, embed_dims=128, context_dim=128,
+                 loss='categorical_crossentropy', optimizer='adam'):
+        super(FFNNLangModelV1, self).__init__()
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dims
+        self.loss = objectives.get(loss)
+        self.loss_fnc = objective_fnc(self.loss)
+        self.optimizer = optimizers.get(optimizer)
+        self.context_size = context_size
+        # self.max_sent_len = max_sent_len
+
+        self.add_input(name='ngrams', ndim=2, dtype='int32')
+
+        self.add_node(Embedding(vocab_size+context_size, embed_dims), name='embedding', inputs='ngrams')
+        # self.add_node(EmbeddingParam(), name='embedding_param', inputs='embedding')
+        self.add_node(Reshape(-1), name='reshape', inputs='embedding')
+        composer_node = Dense(context_size*embed_dims, context_dim)
+        composer_node.params = [composer_node.W]   # drop the bias parameters
+        # del composer_node.b
+        # replace the default behavior of Dense
+        composer_node.get_output = lambda train: node_get_output(composer_node, train)
+        self.add_node(composer_node, name='context_vec', inputs='reshape')
+        # self.add_node(Dropout(0.5), name='dropout', inputs='context_vec')
+        self.add_node(Dense(context_dim, vocab_size, activation='softmax'), name='score',
+                      inputs='context_vec')
+
+        self.add_output('prob', 'score')
+
+        def node_get_output(layer, train=False):
+            X = layer.get_input(train)
+            output = layer.activation(T.dot(X, layer.W))
+            return output
+
+    @staticmethod
+    def encode_length(y_true, y_pred, mask=None):
+        # probs_ = T.sum(y_true * y_pred, axis=-1)
+        probs_ = y_pred[y_true.nonzero()]
+
+        nb_words = y_true.shape[0]
+        probs = probs_.ravel() + 1.0e-30
+
+        return T.sum(T.log(1.0/probs)), nb_words
+
+    # noinspection PyMethodOverriding
+    def compile(self, optimizer=None):
+        if optimizer is not None:
+            logger.info('compiling with %s' % optimizer)
+            self.optimizer = optimizers.get(optimizer)
+        # input of model
+        self.X_train = self.get_input(train=True)
+        self.X_test = self.get_input(train=False)
+
+        self.y_train = self.get_output(train=True)
+        self.y_test = self.get_output(train=False)
+
+        # target of model
+        self.y = T.zeros_like(self.y_train)
+
+        self.weights = None
+
+        # if hasattr(self.layers[-1], "get_output_mask"):
+        #     mask = self.layers[-1].get_output_mask()
+        # else:
+        #     mask = None
+        # todo: mask support
+        mask = None
+        train_loss = self.loss_fnc(self.y, self.y_train, mask)
+        test_loss = self.loss_fnc(self.y, self.y_test, mask)
+
+        train_loss.name = 'train_loss'
+        test_loss.name = 'test_loss'
+        self.y.name = 'y'
+
+        # train_accuracy = T.mean(T.eq(T.argmax(self.y, axis=-1), T.argmax(self.y_train, axis=-1)),
+        #                         dtype=theano.config.floatX)
+        # test_accuracy = T.mean(T.eq(T.argmax(self.y, axis=-1), T.argmax(self.y_test, axis=-1)),
+        #                        dtype=theano.config.floatX)
+
+        train_ce, nb_trn_wrd = self.encode_length(self.y, self.y_train, mask)
+        test_ce, nb_tst_wrd = self.encode_length(self.y, self.y_test, mask)
+
+        self.class_mode = 'categorical'
+        self.theano_mode = None
+
+        for r in self.regularizers:
+            train_loss = r(train_loss)
+        updates = self.optimizer.get_updates(self.params, self.constraints, train_loss)
+        updates += self.updates
+
+        train_ins = [self.X_train, self.y]
+        test_ins = [self.X_test, self.y]
+        # predict_ins = [self.X_test]
+
+        self._train = theano.function(train_ins, [train_loss, train_ce, nb_trn_wrd], updates=updates,
+                                      allow_input_downcast=True)
+        self._train.out_labels = ['loss', 'encode_len', 'nb_words']
+        # self._predict = theano.function(predict_ins, self.y_test, allow_input_downcast=True)
+        # self._predict.out_labels = ['predicted']
+        self._test = theano.function(test_ins, [test_loss, test_ce, nb_tst_wrd], allow_input_downcast=True)
+        self._test.out_labels = ['loss', 'encode_len', 'nb_words']
+
+        # self._train_with_acc = theano.function(train_ins, [train_loss, train_accuracy, train_ce, nb_trn_wrd],
+        #                                        updates=updates,
+        #                                        allow_input_downcast=True, mode=theano_mode)
+        # self._test_with_acc = theano.function(test_ins, [test_loss, test_accuracy],
+        #                                       allow_input_downcast=True, mode=theano_mode)
+
+        # self.__compile_fncs(train_ins, train_loss, test_ins, test_loss, predict_ins, updates)
+
+        self.all_metrics = ['loss', 'ppl', 'val_loss', 'val_ppl']
+
+        # self._train.label2idx = dict((l, idx) for idx, l in enumerate(['loss', 'encode_len', 'nb_words']))
+        # self._test.label2idx = dict((l, idx) for idx, l in enumerate(['loss', 'encode_len', 'nb_words']))
+        #
+        # def __get_metrics_values(f, outs, metrics, prefix=''):
+        #     ret = []
+        #     label2idx = f.label2idx
+        #     for mtrx in metrics:
+        #         if mtrx == 'loss':
+        #             idx = label2idx[mtrx]
+        #             ret.append((prefix+mtrx, outs[idx]))
+        #         elif mtrx == 'ppl':
+        #             nb_words = outs[label2idx['nb_words']]
+        #             encode_len = outs[label2idx['encode_len']]
+        #             ret.append((prefix+'ppl', math.exp(float(encode_len)/float(nb_words))))
+        #         else:
+        #             logger.warn('Specify UNKNOWN metrics ignored')
+        #     return ret
+
+        def __summary_outputs(outs, batch_sizes):
+            out = np.array(outs, dtype=theano.config.floatX)
+            loss, encode_len, nb_words = out
+            batch_size = np.array(batch_sizes, dtype=theano.config.floatX)
+
+            smry_loss = np.sum(loss * batch_size)/batch_size.sum()
+            smry_encode_len = encode_len.sum()
+            smry_nb_words = nb_words.sum()
+            return [smry_loss, smry_encode_len, smry_nb_words]
+
+        # # self._train_with_acc.get_metrics_values = lambda outs, metrics, prefix='': \
+        # #     __get_metrics_values(self._train_with_acc, outs, metrics, prefix)
+        # self._train.get_metrics_values = lambda outs, metrics, prefix='': \
+        #     __get_metrics_values(self._train, outs, metrics, prefix)
+        # self._test.get_metrics_values = lambda outs, metrics, prefix='': \
+        #     __get_metrics_values(self._test, outs, metrics, prefix)
+        # # self._test_with_acc.get_metrics_values = lambda outs, metrics, prefix='': \
+        # #     __get_metrics_values(self._test_with_acc, outs, metrics, prefix)
+
+        # self._train_with_acc.summary_outputs = __summarize_outputs
+        self._train.summarize_outputs = __summary_outputs
+        self._test.summarize_outputs = __summary_outputs
+        # self._test_with_acc.summary_outputs = __summary_outputs
+
+        self.fit = self._fit_unweighted
+
+    def train(self, X, y, callbacks, show_metrics, batch_size=128, extra_callbacks=(LangModelLogger(), ),
+              validation_split=0., validation_data=None, shuffle=False, verbose=1):
+        data = {'ngrams': X, 'prob': y}
+        self.fit(data, callbacks, show_metrics, batch_size=batch_size, nb_epoch=1, verbose=verbose,
+                 extra_callbacks=extra_callbacks, validation_split=validation_split,
+                 validation_data=validation_data, shuffle=shuffle)
+
+    def train_from_dir(self, dir_, data_regex=re.compile(r'\d{3}.bz2'), callbacks=LangHistory(),
+                       show_metrics=('loss', 'ppl'), *args, **kwargs):
+        train_files_ = [os.path.join(dir_, f) for f in os.listdir(dir_) if data_regex.match(f)]
+        train_files = [f for f in train_files_ if os.path.isfile(f)]
+
+        for f in train_files:
+            logger.info('Loading training data from %s' % f)
+            X = np.loadtxt(f, dtype='int32')
+            # y = np.zeros((X.shape[0], X.shape[1], self.vocab_size), dtype=np.int8)
+            pad_idx = np.arange(self.vocab_size, self.vocab_size+self.context_size).reshape((1, -1))
+            pad_idx = pad_idx.repeat(X.shape[0], axis=0)
+            idxes = np.hstack((pad_idx, X))
+
+            ns = X.shape[0]
+            nt = X.shape[1]
+            nb_ele = X.size
+            X = np.empty(shape=(nb_ele, self.context_size), dtype='int32')
+            y_label = np.empty(shape=(nb_ele, ), dtype='int32')
+            start_end = np.array([0, 0], dtype='int32')
+            k = 0
+            for i in range(ns):
+                start_end[0], start_end[1] = 0, self.context_size
+                for j in range(nt):
+                    X[k] = idxes[i, start_end[0]:start_end[1]]
+                    y_label[k] = idxes[i, start_end[1]]
+                    k += 1
+                    start_end += 1
+
+            tmp = np.eye(self.vocab_size, dtype='int8')
+            y = tmp[y_label]
+            # for i in range(X.shape[0]):
+            #     for j in range(X.shape[1]):
+            #         idx = X[i, j]
+            #         y[i, j, idx] = 1
+            logger.info('Training on %s' % f)
+            self.train(X, y, callbacks, show_metrics, *args, **kwargs)
+
+
+class SimpAttLayer(Recurrent):
+    """ Recurrent Layer with simple attention mechanics implemented.
+    """
+
+    def __init__(self, input_dim, output_dim=128, train_init_cell=True, train_init_h=True,
+                 init='glorot_uniform', inner_init='orthogonal', forget_bias_init='one',
+                 input_activation='tanh', gate_activation='hard_sigmoid', output_activation='tanh',
+                 weights=None, truncate_gradient=-1, attention_len=10):
+
+        super(SimpAttLayer, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.truncate_gradient = truncate_gradient
+        self.init = initializations.get(init)
+        self.inner_init = initializations.get(inner_init)
+        self.forget_bias_init = initializations.get(forget_bias_init)
+        self.input_activation = activations.get(input_activation)
+        self.gate_activation = activations.get(gate_activation)
+        self.output_activation = activations.get(output_activation)
+        self.input = T.tensor3()
+        self.time_range = None
+        self.attention_len = attention_len
+
+        W_z = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_z = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_z = shared_zeros(self.output_dim)
+
+        W_i = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_i = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_i = shared_zeros(self.output_dim)
+
+        W_f = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_f = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_f = self.forget_bias_init(self.output_dim)
+
+        W_o = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_o = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_o = shared_zeros(self.output_dim)
+
+        self.W_s = self.init((self.output_dim, self.input_dim))
+        self.b_s = theano.shared(np.zeros(shape=(self.input_dim,), dtype=floatX), name='bias_trans', borrow=True)
+
+        self.h_m1 = shared_zeros(shape=(1, self.output_dim), name='h0')
+        self.c_m1 = shared_zeros(shape=(1, self.output_dim), name='c0')
+
+        W = np.vstack((W_z[np.newaxis, :, :],
+                       W_i[np.newaxis, :, :],
+                       W_f[np.newaxis, :, :],
+                       W_o[np.newaxis, :, :]))  # shape = (4, input_dim, output_dim)
+        R = np.vstack((R_z[np.newaxis, :, :],
+                       R_i[np.newaxis, :, :],
+                       R_f[np.newaxis, :, :],
+                       R_o[np.newaxis, :, :]))  # shape = (4, output_dim, output_dim)
+        self.W = theano.shared(W, name='Input to hidden weights (zifo)', borrow=True)
+        self.R = theano.shared(R, name='Recurrent weights (zifo)', borrow=True)
+        self.b = theano.shared(np.zeros(shape=(4, self.output_dim), dtype=theano.config.floatX),
+                               name='bias', borrow=True)
+        np_b_pos = np.zeros((self.attention_len+1, ), dtype=floatX)
+        np_b_pos[0] = 1.0
+        self.b_pos = theano.shared(np_b_pos, name='b_pos', borrow=True)
+        self.bos_vec = theano.shared(np.zeros((1, self.input_dim), dtype=floatX), name='Begin of sentence', borrow=True)
+
+        self.params = [self.W, self.R, self.b, self.W_s, self.b_s, self.b_pos, self.bos_vec]
+        if train_init_cell:
+            self.params.append(self.c_m1)
+        if train_init_h:
+            self.params.append(self.h_m1)
+
+        if weights is not None:
+            self.set_weights(weights)
+
+    def _step(self,
+              t,                                # sequence. t: scalar
+              h_tm1, c_tm1,                     # output_info. h_tm1: (n_s, d_c), c_tm1: (n_s, d_c)
+              R, W, bias, E_w, b_pos, W_s, b_s):      # non_sequence. R:(d_c, d_c), E_w:(t_max, n_s, d_e),
+                                                      # W: (4, d_e, d_c)
+        if t == 1:
+            X_t = E_w[0]
+        else:
+            s_t = T.dot(h_tm1, W_s) + b_s    # (n_s, d_e)
+            pos = T.arange(t-1, -1, -1, dtype='int16')    # (t, )
+            pos = T.switch(pos > self.attention_len, self.attention_len, pos)    # (t, )
+            embeds = E_w[:t]  # (t, n_s, d_e)
+            score_t = T.sum(s_t*embeds, axis=-1).dimshuffle(1, 0) + b_pos[pos]   # (n_s, t)
+            # alpha_t = T.nnet.softmax(score_t)   # (n_s, t)
+            e_score = T.exp(score_t - T.max(score_t, axis=1, keepdims=True))
+            alpha_t = e_score / T.sum(e_score, axis=1, keepdims=True)
+            X_t = T.sum(alpha_t.dimshuffle(1, 0, 'x') * embeds, axis=0)   # (n_s, d_e)
+
+        Y_t = T.dot(X_t, W) + bias   # (n_s, 4, d_c)
+        G_tm1 = T.dot(h_tm1, R)      # (n_s, 4, d_c)
+        M_t = Y_t + G_tm1            # (n_s, 4, d_c)
+
+        z_t = self.input_activation(M_t[:, 0, :])
+        ifo_t = self.gate_activation(M_t[:, 1:, :])
+        i_t = ifo_t[:, 0, :]
+        f_t = ifo_t[:, 1, :]
+        o_t = ifo_t[:, 2, :]
+        c_t = f_t * c_tm1 + i_t * z_t
+        h_t = o_t * self.output_activation(c_t)
+        return h_t, c_t
+
+    def get_output_mask(self, train=None):
+        return None
+
+    def _get_output_with_mask(self, train=False):
+        raise NotImplementedError('mask not supported for now')
+        # X = self.get_input(train)
+        # # mask = self.get_padded_shuffled_mask(train, X, pad=0)
+        # mask = self.get_input_mask(train=train)
+        # ind = T.switch(T.eq(mask[:, -1], 1.), mask.shape[-1], T.argmin(mask, axis=-1)).astype('int32').ravel()
+        # max_time = T.max(ind) - 1   # drop the last frame
+        # X = X.dimshuffle((1, 0, 2))
+        # Y = T.dot(X, self.W) + self.b
+        # # h0 = T.unbroadcast(alloc_zeros_matrix(X.shape[1], self.output_dim), 1)
+        # h0 = T.repeat(self.h_m1, X.shape[1], axis=0)
+        # c0 = T.repeat(self.c_m1, X.shape[1], axis=0)
+        #
+        # [outputs, _], updates = theano.scan(
+        #     self._step,
+        #     sequences=Y,
+        #     outputs_info=[h0, c0],
+        #     non_sequences=[self.R], n_steps=max_time,
+        #     truncate_gradient=self.truncate_gradient, strict=True,
+        #     allow_gc=theano.config.scan.allow_gc)
+        #
+        # res = T.concatenate([h0.dimshuffle('x', 0, 1), outputs], axis=0).dimshuffle((1, 0, 2))
+        # return res
+
+    def _get_output_without_mask(self, train=False):
+        X = self.get_input(train)  # (n_s, n_t, d_e)
+        max_time, ns = X.shape[1], X.shape[0]
+        X = X[:, :-1]  # drop the last frame:          # (n_s, n_t-1, d_e)
+        bos = T.repeat(self.bos_vec, ns, axis=0)       # (n_s, d_e)
+        bos = T.reshape(bos, (ns, 1, self.input_dim))  # (n_s, 1, d_e)
+        X = T.concatenate([bos, X], axis=1)            # (n_s, n_t, d_e)
+        X = X.dimshuffle(1, 0, 2)                      # (n_t, n_s, d_e)
+
+        h0 = T.repeat(self.h_m1, ns, axis=0)
+        c0 = T.repeat(self.c_m1, ns, axis=0)
+
+        [outputs, _], updates = theano.scan(
+            self._step,
+            sequences=T.arange(1, max_time+1, dtype='int16'),
+            outputs_info=[h0, c0],
+            # R, W, bias, E_w, b_pos, W_s, b_s)
+            non_sequences=[self.R, self.W, self.b, X, self.b_pos, self.W_s, self.b_s],
+            n_steps=max_time, strict=True,
+            truncate_gradient=self.truncate_gradient,
+            allow_gc=theano.config.scan.allow_gc)
+
+        res = outputs.dimshuffle(1, 0, 2)
+        return res
+
+    def get_output(self, train=False):
+        mask = self.get_input_mask(train=train)
+        if mask is None:
+            return self._get_output_without_mask(train=train)
+        else:
+            return self._get_output_with_mask(train=train)
+
+    def set_init_cell_parameter(self, is_param=True):
+        if is_param:
+            if self.c_m1 not in self.params:
+                self.params.append(self.c_m1)
+        else:
+            self.params.remove(self.c_m1)
+
+    def set_init_h_parameter(self, is_param=True):
+        if is_param:
+            if self.h_m1 not in self.params:
+                self.params.append(self.h_m1)
+        else:
+            self.params.remove(self.h_m1)
+
+    def get_time_range(self, train):
+        mask = self.get_input_mask(train=train)
+        ind = T.switch(T.eq(mask[:, -1], 1.), mask.shape[-1], T.argmin(mask, axis=-1)).astype('int32')
+        self.time_range = ind
+        return ind
+
+    def get_config(self):
+        return {"name": self.__class__.__name__,
+                "input_dim": self.input_dim,
+                "output_dim": self.output_dim,
+                "init": self.init.__name__,
+                "inner_init": self.inner_init.__name__,
+                "forget_bias_init": self.forget_bias_init.__name__,
+                "input_activation": self.input_activation.__name__,
+                "gate_activation": self.gate_activation.__name__,
+                "truncate_gradient": self.truncate_gradient}
+
+
+class ParallelAttLayerV0(Recurrent):
+    """ Recurrent Layer with parallel attention mechanics implemented.
+        This version may be more memory efficient than V1 with some restrictions.
+    """
+
+    def __init__(self, input_dim, output_dim=128, train_init_cell=True, train_init_h=True,
+                 init='glorot_uniform', inner_init='orthogonal', forget_bias_init='one',
+                 input_activation='tanh', gate_activation='hard_sigmoid', output_activation='tanh',
+                 weights=None, truncate_gradient=-1, attention_len=10, max_sent_len=64, max_min_batch=2048):
+
+        super(ParallelAttLayerV0, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.truncate_gradient = truncate_gradient
+        self.init = initializations.get(init)
+        self.inner_init = initializations.get(inner_init)
+        self.forget_bias_init = initializations.get(forget_bias_init)
+        self.input_activation = activations.get(input_activation)
+        self.gate_activation = activations.get(gate_activation)
+        self.output_activation = activations.get(output_activation)
+        self.input = T.tensor3()
+        self.time_range = None
+        self.attention_len = attention_len
+        self._score_table = theano.shared(np.zeros((max_min_batch, max_sent_len), dtype=floatX), borrow=True)
+        self._exp_score_table = theano.shared(np.zeros((max_min_batch, max_sent_len), dtype=floatX), borrow=True)
+        self._alpha_table = theano.shared(np.zeros((max_min_batch, max_sent_len), dtype=floatX), borrow=True)
+        self.max_sent_len = max_sent_len
+
+        logger.warn('Only support mini-batch smaller than or equal to %d' % max_min_batch)
+
+        W_z = self.init((self.input_dim, 2*self.output_dim)).get_value(borrow=True)
+        R_z = self.inner_init((self.output_dim, 2*self.output_dim)).get_value(borrow=True)
+        # self.b_z = shared_zeros(self.output_dim)
+
+        W_i = self.init((self.input_dim, 2*self.output_dim)).get_value(borrow=True)
+        R_i = self.inner_init((self.output_dim, 2*self.output_dim)).get_value(borrow=True)
+        # self.b_i = shared_zeros(self.output_dim)
+
+        W_f = self.init((self.input_dim, 2*self.output_dim)).get_value(borrow=True)
+        R_f = self.inner_init((self.output_dim, 2*self.output_dim)).get_value(borrow=True)
+        # self.b_f = self.forget_bias_init(self.output_dim)
+
+        W_o = self.init((self.input_dim, 2*self.output_dim)).get_value(borrow=True)
+        R_o = self.inner_init((self.output_dim, 2*self.output_dim)).get_value(borrow=True)
+        # self.b_o = shared_zeros(self.output_dim)
+
+        self.W_s = self.init((self.output_dim, self.input_dim))
+        self.b_s = theano.shared(np.zeros(shape=(self.input_dim,), dtype=floatX), name='bias_trans', borrow=True)
+
+        self.h_m1 = shared_zeros(shape=(1, 2*self.output_dim), name='h0')
+        self.c_m1 = shared_zeros(shape=(1, 2*self.output_dim), name='c0')
+
+        W = np.vstack((W_z[np.newaxis, :, :],
+                       W_i[np.newaxis, :, :],
+                       W_f[np.newaxis, :, :],
+                       W_o[np.newaxis, :, :]))  # shape = (4, input_dim, 2*output_dim)
+        R = np.vstack((R_z[np.newaxis, :, :],
+                       R_i[np.newaxis, :, :],
+                       R_f[np.newaxis, :, :],
+                       R_o[np.newaxis, :, :]))  # shape = (4, output_dim, 2*output_dim)
+        self.W = theano.shared(W, name='Input to hidden weights (zifo)', borrow=True)
+        self.R = theano.shared(R, name='Recurrent weights (zifo)', borrow=True)
+        self.b = theano.shared(np.zeros(shape=(4, 2*self.output_dim), dtype=theano.config.floatX),
+                               name='bias', borrow=True)
+        np_b_pos = np.zeros((self.attention_len+1, ), dtype=floatX)
+        np_b_pos[0] = 1.0
+        self.b_pos = theano.shared(np_b_pos, name='b_pos', borrow=True)
+        self.bos_vec = theano.shared(np.zeros((1, self.input_dim), dtype=floatX), name='Begin of sentence', borrow=True)
+
+        self.params = [self.W, self.R, self.b, self.W_s, self.b_s, self.b_pos, self.bos_vec]
+        if train_init_cell:
+            self.params.append(self.c_m1)
+        if train_init_h:
+            self.params.append(self.h_m1)
+
+        if weights is not None:
+            self.set_weights(weights)
+
+    def _step(self,
+              t,                                # sequence. t: scalar, t=1,2,...,t_max
+              h_tm1, c_tm1,                     # output_info. h_tm1: (n_s, 2*d_c), c_tm1: (n_s, 2*d_c)
+              R, W, bias, E_w, b_pos, W_s, b_s, score_table, exp_score_table, alpha_table):
+              # non_sequence. R:(2*d_c, 2*d_c), E_w:(t_max, n_s, d_e),
+              # W: (4, d_e, 2*d_c)
+        if t == 1:
+            X_t = E_w[0]
+        else:
+            s_t = T.dot(h_tm1[:, :self.output_dim], W_s) + b_s    # (n_s, d_e)
+            pos = T.arange(t-1, -1, -1, dtype='int16')    # (t, )
+            pos = T.switch(pos > self.attention_len, self.attention_len, pos)    # (t, )
+            embeds = E_w[:t]  # (t, n_s, d_e)
+            n_s = embeds.shape[1]
+            # score_t = T.sum(s_t*embeds, axis=-1).dimshuffle(1, 0) + b_pos[pos]   # (n_s, t)
+            s_tbl = T.set_subtensor(score_table[:n_s, :t], T.sum(s_t*embeds, axis=-1).dimshuffle(1, 0) + b_pos[pos])
+                                    #inplace=True)
+            # alpha_t = T.nnet.softmax(score_t)   # (n_s, t)
+            # e_score = T.exp(score_t - T.max(score_t, axis=1, keepdims=True))
+            exp_tbl = T.set_subtensor(exp_score_table[:n_s, :t],
+                                      T.exp(s_tbl[:n_s, :t] - T.max(s_tbl[:n_s, :t], axis=1, keepdims=True)))
+                                      # inplace=True)
+            # alpha_t = e_score / T.sum(e_score, axis=1, keepdims=True)
+            alpha_tbl = T.set_subtensor(alpha_table[:n_s, :t],
+                                        exp_tbl[:n_s, :t] / T.sum(exp_tbl[:n_s, :t], axis=1, keepdims=True))
+                                        # inplace=True)
+            X_t = T.sum(alpha_tbl[:n_s, :t].dimshuffle(1, 0, 'x') * embeds, axis=0)   # (n_s, d_e)
+
+        Y_t = T.dot(X_t, W) + bias   # (n_s, 4, 2*d_c)
+        G_tm1 = T.dot(h_tm1[:, self.output_dim:], R)      # (n_s, 4, 2*d_c)
+        M_t = Y_t + G_tm1            # (n_s, 4, 2*d_c)
+
+        z_t = self.input_activation(M_t[:, 0, :])
+        ifo_t = self.gate_activation(M_t[:, 1:, :])
+        i_t = ifo_t[:, 0, :]
+        f_t = ifo_t[:, 1, :]
+        o_t = ifo_t[:, 2, :]
+        c_t = f_t * c_tm1 + i_t * z_t
+        h_t = o_t * self.output_activation(c_t)
+        return h_t, c_t
+
+    def get_output_mask(self, train=None):
+        return None
+
+    def _get_output_with_mask(self, train=False):
+        raise NotImplementedError('mask not supported for now')
+        # X = self.get_input(train)
+        # # mask = self.get_padded_shuffled_mask(train, X, pad=0)
+        # mask = self.get_input_mask(train=train)
+        # ind = T.switch(T.eq(mask[:, -1], 1.), mask.shape[-1], T.argmin(mask, axis=-1)).astype('int32').ravel()
+        # max_time = T.max(ind) - 1   # drop the last frame
+        # X = X.dimshuffle((1, 0, 2))
+        # Y = T.dot(X, self.W) + self.b
+        # # h0 = T.unbroadcast(alloc_zeros_matrix(X.shape[1], self.output_dim), 1)
+        # h0 = T.repeat(self.h_m1, X.shape[1], axis=0)
+        # c0 = T.repeat(self.c_m1, X.shape[1], axis=0)
+        #
+        # [outputs, _], updates = theano.scan(
+        #     self._step,
+        #     sequences=Y,
+        #     outputs_info=[h0, c0],
+        #     non_sequences=[self.R], n_steps=max_time,
+        #     truncate_gradient=self.truncate_gradient, strict=True,
+        #     allow_gc=theano.config.scan.allow_gc)
+        #
+        # res = T.concatenate([h0.dimshuffle('x', 0, 1), outputs], axis=0).dimshuffle((1, 0, 2))
+        # return res
+
+    def _get_output_without_mask(self, train=False):
+        X = self.get_input(train)  # (n_s, n_t, d_e)
+        max_time, ns = X.shape[1], X.shape[0]
+        X = X[:, :-1]  # drop the last frame:          # (n_s, n_t-1, d_e)
+        bos = T.repeat(self.bos_vec, ns, axis=0)       # (n_s, d_e)
+        bos = T.reshape(bos, (ns, 1, self.input_dim))  # (n_s, 1, d_e)
+        X = T.concatenate([bos, X], axis=1)            # (n_s, n_t, d_e)
+        X = X.dimshuffle(1, 0, 2)                      # (n_t, n_s, d_e)
+
+        h0 = T.repeat(self.h_m1, ns, axis=0)
+        c0 = T.repeat(self.c_m1, ns, axis=0)
+
+        [outputs, _], updates = theano.scan(
+            self._step,
+            sequences=T.arange(1, max_time+1, dtype='int16'),
+            outputs_info=[h0, c0],
+            # R, W, bias, E_w, b_pos, W_s, b_s)
+            non_sequences=[self.R, self.W, self.b, X, self.b_pos, self.W_s, self.b_s,
+                           self._score_table, self._exp_score_table, self._alpha_table],
+            n_steps=max_time, strict=True,
+            truncate_gradient=self.truncate_gradient,
+            allow_gc=theano.config.scan.allow_gc)
+
+        res = outputs.dimshuffle(1, 0, 2)
+        return res[:, :, self.output_dim:]
+
+    def get_output(self, train=False):
+        mask = self.get_input_mask(train=train)
+        if mask is None:
+            return self._get_output_without_mask(train=train)
+        else:
+            return self._get_output_with_mask(train=train)
+
+    def set_init_cell_parameter(self, is_param=True):
+        if is_param:
+            if self.c_m1 not in self.params:
+                self.params.append(self.c_m1)
+        else:
+            self.params.remove(self.c_m1)
+
+    def set_init_h_parameter(self, is_param=True):
+        if is_param:
+            if self.h_m1 not in self.params:
+                self.params.append(self.h_m1)
+        else:
+            self.params.remove(self.h_m1)
+
+    def get_time_range(self, train):
+        mask = self.get_input_mask(train=train)
+        ind = T.switch(T.eq(mask[:, -1], 1.), mask.shape[-1], T.argmin(mask, axis=-1)).astype('int32')
+        self.time_range = ind
+        return ind
+
+    def get_config(self):
+        return {"name": self.__class__.__name__,
+                "input_dim": self.input_dim,
+                "output_dim": self.output_dim,
+                "init": self.init.__name__,
+                "inner_init": self.inner_init.__name__,
+                "forget_bias_init": self.forget_bias_init.__name__,
+                "input_activation": self.input_activation.__name__,
+                "gate_activation": self.gate_activation.__name__,
+                "truncate_gradient": self.truncate_gradient}
+
+
+class ParallelAttLayer(Recurrent):
+    """ Recurrent Layer with parallel attention mechanics implemented.
+    """
+
+    def __init__(self, input_dim, output_dim=128, train_init_cell=True, train_init_h=True,
+                 init='glorot_uniform', inner_init='orthogonal', forget_bias_init='one',
+                 input_activation='tanh', gate_activation='hard_sigmoid', output_activation='tanh',
+                 weights=None, truncate_gradient=-1, attention_len=10):
+
+        super(ParallelAttLayer, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.truncate_gradient = truncate_gradient
+        self.init = initializations.get(init)
+        self.inner_init = initializations.get(inner_init)
+        self.forget_bias_init = initializations.get(forget_bias_init)
+        self.input_activation = activations.get(input_activation)
+        self.gate_activation = activations.get(gate_activation)
+        self.output_activation = activations.get(output_activation)
+        self.input = T.tensor3()
+        self.time_range = None
+        self.attention_len = attention_len
+
+        W_z = self.init((self.input_dim, 2*self.output_dim)).get_value(borrow=True)
+        R_z = self.inner_init((self.output_dim, 2*self.output_dim)).get_value(borrow=True)
+        # self.b_z = shared_zeros(self.output_dim)
+
+        W_i = self.init((self.input_dim, 2*self.output_dim)).get_value(borrow=True)
+        R_i = self.inner_init((self.output_dim, 2*self.output_dim)).get_value(borrow=True)
+        # self.b_i = shared_zeros(self.output_dim)
+
+        W_f = self.init((self.input_dim, 2*self.output_dim)).get_value(borrow=True)
+        R_f = self.inner_init((self.output_dim, 2*self.output_dim)).get_value(borrow=True)
+        # self.b_f = self.forget_bias_init(self.output_dim)
+
+        W_o = self.init((self.input_dim, 2*self.output_dim)).get_value(borrow=True)
+        R_o = self.inner_init((self.output_dim, 2*self.output_dim)).get_value(borrow=True)
+        # self.b_o = shared_zeros(self.output_dim)
+
+        self.W_s = self.init((self.output_dim, self.input_dim))
+        self.b_s = theano.shared(np.zeros(shape=(self.input_dim,), dtype=floatX), name='bias_trans', borrow=True)
+
+        self.h_m1 = shared_zeros(shape=(1, 2*self.output_dim), name='h0')
+        self.c_m1 = shared_zeros(shape=(1, 2*self.output_dim), name='c0')
+
+        W = np.vstack((W_z[np.newaxis, :, :],
+                       W_i[np.newaxis, :, :],
+                       W_f[np.newaxis, :, :],
+                       W_o[np.newaxis, :, :]))  # shape = (4, input_dim, 2*output_dim)
+        R = np.vstack((R_z[np.newaxis, :, :],
+                       R_i[np.newaxis, :, :],
+                       R_f[np.newaxis, :, :],
+                       R_o[np.newaxis, :, :]))  # shape = (4, output_dim, 2*output_dim)
+        self.W = theano.shared(W, name='Input to hidden weights (zifo)', borrow=True)
+        self.R = theano.shared(R, name='Recurrent weights (zifo)', borrow=True)
+        self.b = theano.shared(np.zeros(shape=(4, 2*self.output_dim), dtype=theano.config.floatX),
+                               name='bias', borrow=True)
+        np_b_pos = np.zeros((self.attention_len+1, ), dtype=floatX)
+        np_b_pos[0] = 1.0
+        self.b_pos = theano.shared(np_b_pos, name='b_pos', borrow=True)
+        self.bos_vec = theano.shared(np.zeros((1, self.input_dim), dtype=floatX), name='Begin of sentence', borrow=True)
+
+        self.params = [self.W, self.R, self.b, self.W_s, self.b_s, self.b_pos, self.bos_vec]
+        if train_init_cell:
+            self.params.append(self.c_m1)
+        if train_init_h:
+            self.params.append(self.h_m1)
+
+        if weights is not None:
+            self.set_weights(weights)
+
+    def _step(self,
+              t,                                # sequence. t: scalar, t=1,2,...,t_max
+              h_tm1, c_tm1,                     # output_info. h_tm1: (n_s, 2*d_c), c_tm1: (n_s, 2*d_c)
+              R, W, bias, E_w, b_pos, W_s, b_s):
+              # non_sequence. R:(2*d_c, 2*d_c), E_w:(t_max, n_s, d_e),
+              # W: (4, d_e, 2*d_c)
+        if t == 1:
+            X_t = E_w[0]
+        else:
+            s_t = T.tanh(T.dot(h_tm1[:, :self.output_dim], W_s) + b_s)    # (n_s, d_e)
+            pos = T.arange(t-1, -1, -1, dtype='int16')    # (t, )
+            pos = T.switch(pos > self.attention_len, self.attention_len, pos)    # (t, )
+            embeds = E_w[:t]  # (t, n_s, d_e)
+            score_t = T.sum(s_t*embeds, axis=-1).dimshuffle(1, 0) + b_pos[pos]   # (n_s, t)
+            # alpha_t = T.nnet.softmax(score_t)   # (n_s, t)
+            e_score = T.exp(score_t - T.max(score_t, axis=1, keepdims=True))     # (n_s, t)
+            alpha_t = e_score / T.sum(e_score, axis=1, keepdims=True)            # (n_s, t)
+            X_t = T.sum(alpha_t.dimshuffle(1, 0, 'x') * embeds, axis=0)          # (n_s, d_e)
+
+        Y_t = T.dot(X_t, W) + bias   # (n_s, 4, 2*d_c)
+        G_tm1 = T.dot(h_tm1[:, self.output_dim:], R)      # (n_s, 4, 2*d_c)
+        M_t = Y_t + G_tm1            # (n_s, 4, 2*d_c)
+
+        z_t = self.input_activation(M_t[:, 0, :])
+        ifo_t = self.gate_activation(M_t[:, 1:, :])
+        i_t = ifo_t[:, 0, :]
+        f_t = ifo_t[:, 1, :]
+        o_t = ifo_t[:, 2, :]
+        c_t = f_t * c_tm1 + i_t * z_t
+        h_t = o_t * self.output_activation(c_t)
+        return h_t, c_t
+
+    def get_output_mask(self, train=None):
+        return None
+
+    def _get_output_with_mask(self, train=False):
+        raise NotImplementedError('mask not supported for now')
+        # X = self.get_input(train)
+        # # mask = self.get_padded_shuffled_mask(train, X, pad=0)
+        # mask = self.get_input_mask(train=train)
+        # ind = T.switch(T.eq(mask[:, -1], 1.), mask.shape[-1], T.argmin(mask, axis=-1)).astype('int32').ravel()
+        # max_time = T.max(ind) - 1   # drop the last frame
+        # X = X.dimshuffle((1, 0, 2))
+        # Y = T.dot(X, self.W) + self.b
+        # # h0 = T.unbroadcast(alloc_zeros_matrix(X.shape[1], self.output_dim), 1)
+        # h0 = T.repeat(self.h_m1, X.shape[1], axis=0)
+        # c0 = T.repeat(self.c_m1, X.shape[1], axis=0)
+        #
+        # [outputs, _], updates = theano.scan(
+        #     self._step,
+        #     sequences=Y,
+        #     outputs_info=[h0, c0],
+        #     non_sequences=[self.R], n_steps=max_time,
+        #     truncate_gradient=self.truncate_gradient, strict=True,
+        #     allow_gc=theano.config.scan.allow_gc)
+        #
+        # res = T.concatenate([h0.dimshuffle('x', 0, 1), outputs], axis=0).dimshuffle((1, 0, 2))
+        # return res
+
+    def _get_output_without_mask(self, train=False):
+        X = self.get_input(train)  # (n_s, n_t, d_e)
+        max_time, ns = X.shape[1], X.shape[0]
+        X = X[:, :-1]  # drop the last frame:          # (n_s, n_t-1, d_e)
+        bos = T.repeat(self.bos_vec, ns, axis=0)       # (n_s, d_e)
+        bos = T.reshape(bos, (ns, 1, self.input_dim))  # (n_s, 1, d_e)
+        X = T.concatenate([bos, X], axis=1)            # (n_s, n_t, d_e)
+        X = X.dimshuffle(1, 0, 2)                      # (n_t, n_s, d_e)
+
+        h0 = T.repeat(self.h_m1, ns, axis=0)
+        c0 = T.repeat(self.c_m1, ns, axis=0)
+
+        [outputs, _], updates = theano.scan(
+            self._step,
+            sequences=T.arange(1, max_time+1, dtype='int16'),
+            outputs_info=[h0, c0],
+            # R, W, bias, E_w, b_pos, W_s, b_s)
+            non_sequences=[self.R, self.W, self.b, X, self.b_pos, self.W_s, self.b_s],
+            n_steps=max_time, strict=True,
+            truncate_gradient=self.truncate_gradient,
+            allow_gc=theano.config.scan.allow_gc)
+
+        res = outputs.dimshuffle(1, 0, 2)
+        return res[:, :, self.output_dim:]
+
+    def get_output(self, train=False):
+        mask = self.get_input_mask(train=train)
+        if mask is None:
+            return self._get_output_without_mask(train=train)
+        else:
+            return self._get_output_with_mask(train=train)
+
+    def set_init_cell_parameter(self, is_param=True):
+        if is_param:
+            if self.c_m1 not in self.params:
+                self.params.append(self.c_m1)
+        else:
+            self.params.remove(self.c_m1)
+
+    def set_init_h_parameter(self, is_param=True):
+        if is_param:
+            if self.h_m1 not in self.params:
+                self.params.append(self.h_m1)
+        else:
+            self.params.remove(self.h_m1)
+
+    def get_time_range(self, train):
+        mask = self.get_input_mask(train=train)
+        ind = T.switch(T.eq(mask[:, -1], 1.), mask.shape[-1], T.argmin(mask, axis=-1)).astype('int32')
+        self.time_range = ind
+        return ind
+
+    def get_config(self):
+        return {"name": self.__class__.__name__,
+                "input_dim": self.input_dim,
+                "output_dim": self.output_dim,
+                "init": self.init.__name__,
+                "inner_init": self.inner_init.__name__,
+                "forget_bias_init": self.forget_bias_init.__name__,
+                "input_activation": self.input_activation.__name__,
+                "gate_activation": self.gate_activation.__name__,
+                "truncate_gradient": self.truncate_gradient}
+
+class SimpAttLangModel(Sequential):
+    def __init__(self, vocab_size, embed_dims=128, context_dim=128, attention_len=10,
+                 loss='categorical_crossentropy', optimizer='adam'):
+        super(SimpAttLangModel, self).__init__()
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dims
+
+        self.optimizer = optimizers.get(optimizer)
+        self.loss = objectives.get(loss)
+        self.loss_fnc = objective_fnc(self.loss)
+
+        self.add(Embedding(input_dim=vocab_size, output_dim=embed_dims))
+        self.add(SimpAttLayer(input_dim=embed_dims, output_dim=context_dim, attention_len=attention_len))
+        self.add(Dense(input_dim=context_dim, output_dim=vocab_size, activation='softmax'))
+
+    @staticmethod
+    def encode_length(y_true, y_pred, mask):
+        probs_ = T.sum(y_true * y_pred, axis=-1)
+
+        if mask is None:
+            nb_words = y_true.shape[0] * y_true.shape[1]
+            probs = probs_.ravel() + 1.0e-30
+        else:
+            nb_words = mask.sum()
+            probs = probs_[mask.nonzero()] + 1.0e-30
+
+        return T.sum(T.log(1.0/probs)), nb_words
+
+    def train(self, X, y, callbacks, show_metrics, batch_size=128, extra_callbacks=(LangModelLogger(), ),
+              validation_split=0., validation_data=None, shuffle=False, verbose=1):
+        self.fit(X, y, callbacks, show_metrics, batch_size=batch_size, nb_epoch=1, verbose=verbose,
+                 extra_callbacks=extra_callbacks, validation_split=validation_split,
+                 validation_data=validation_data, shuffle=shuffle, show_accuracy=False)
+
+    def train_from_dir(self, dir_, data_regex=re.compile(r'\d{3}.bz2'), callbacks=LangHistory(),
+                       show_metrics=('loss', 'ppl'), *args, **kwargs):
+        train_files_ = [os.path.join(dir_, f) for f in os.listdir(dir_) if data_regex.match(f)]
+        train_files = [f for f in train_files_ if os.path.isfile(f)]
+
+        for f in train_files:
+            logger.info('Loading training data from %s' % f)
+            X = np.loadtxt(f, dtype='int32')
+            # y = np.zeros((X.shape[0], X.shape[1], self.vocab_size), dtype=np.int8)
+            tmp = np.eye(self.vocab_size, dtype='int8')
+            y = tmp[X]
+            # for i in range(X.shape[0]):
+            #     for j in range(X.shape[1]):
+            #         idx = X[i, j]
+            #         y[i, j, idx] = 1
+            logger.info('Training on %s' % f)
+            self.train(X, y, callbacks, show_metrics, *args, **kwargs)
+
+    # noinspection PyMethodOverriding
+    def compile(self, optimizer=None):
+        if optimizer is not None:
+            logger.info('compiling with %s' % optimizer)
+            self.optimizer = optimizers.get(optimizer)
+        # input of model
+        self.X_train = self.get_input(train=True)
+        self.X_test = self.get_input(train=False)
+
+        self.y_train = self.get_output(train=True)
+        self.y_test = self.get_output(train=False)
+
+        # target of model
+        self.y = T.zeros_like(self.y_train)
+
+        self.weights = None
+
+        if hasattr(self.layers[-1], "get_output_mask"):
+            mask = self.layers[-1].get_output_mask()
+        else:
+            mask = None
+
+        train_loss = self.loss_fnc(self.y, self.y_train, mask)
+        test_loss = self.loss_fnc(self.y, self.y_test, mask)
+
+        train_loss.name = 'train_loss'
+        test_loss.name = 'test_loss'
+        self.y.name = 'y'
+
+        # train_accuracy = T.mean(T.eq(T.argmax(self.y, axis=-1), T.argmax(self.y_train, axis=-1)),
+        #                         dtype=theano.config.floatX)
+        # test_accuracy = T.mean(T.eq(T.argmax(self.y, axis=-1), T.argmax(self.y_test, axis=-1)),
+        #                        dtype=theano.config.floatX)
+
+        train_ce, nb_trn_wrd = self.encode_length(self.y, self.y_train, mask)
+        test_ce, nb_tst_wrd = self.encode_length(self.y, self.y_test, mask)
+
+        self.class_mode = 'categorical'
+        self.theano_mode = None
+
+        for r in self.regularizers:
+            train_loss = r(train_loss)
+        updates = self.optimizer.get_updates(self.params, self.constraints, train_loss)
+        updates += self.updates
+
+        train_ins = [self.X_train, self.y]
+        test_ins = [self.X_test, self.y]
+        predict_ins = [self.X_test]
+
+        self._train = theano.function(train_ins, [train_loss, train_ce, nb_trn_wrd], updates=updates,
+                                      allow_input_downcast=True)
+        self._train.out_labels = ['loss', 'encode_len', 'nb_words']
+        # self._predict = theano.function(predict_ins, self.y_test, allow_input_downcast=True)
+        # self._predict.out_labels = ['predicted']
+        self._test = theano.function(test_ins, [test_loss, test_ce, nb_tst_wrd], allow_input_downcast=True)
+        self._test.out_labels = ['loss', 'encode_len', 'nb_words']
+
+        # self._train_with_acc = theano.function(train_ins, [train_loss, train_accuracy, train_ce, nb_trn_wrd],
+        #                                        updates=updates,
+        #                                        allow_input_downcast=True, mode=theano_mode)
+        # self._test_with_acc = theano.function(test_ins, [test_loss, test_accuracy],
+        #                                       allow_input_downcast=True, mode=theano_mode)
+
+        # self.__compile_fncs(train_ins, train_loss, test_ins, test_loss, predict_ins, updates)
+
+        self.all_metrics = ['loss', 'ppl', 'val_loss', 'val_ppl']
+
+        # self._train.label2idx = dict((l, idx) for idx, l in enumerate(['loss', 'encode_len', 'nb_words']))
+        # self._test.label2idx = dict((l, idx) for idx, l in enumerate(['loss', 'encode_len', 'nb_words']))
+        #
+        # def __get_metrics_values(f, outs, metrics, prefix=''):
+        #     ret = []
+        #     label2idx = f.label2idx
+        #     for mtrx in metrics:
+        #         if mtrx == 'loss':
+        #             idx = label2idx[mtrx]
+        #             ret.append((prefix+mtrx, outs[idx]))
+        #         elif mtrx == 'ppl':
+        #             nb_words = outs[label2idx['nb_words']]
+        #             encode_len = outs[label2idx['encode_len']]
+        #             ret.append((prefix+'ppl', math.exp(float(encode_len)/float(nb_words))))
+        #         else:
+        #             logger.warn('Specify UNKNOWN metrics ignored')
+        #     return ret
+
+        def __summary_outputs(outs, batch_sizes):
+            out = np.array(outs, dtype=theano.config.floatX)
+            loss, encode_len, nb_words = out
+            batch_size = np.array(batch_sizes, dtype=theano.config.floatX)
+
+            smry_loss = np.sum(loss * batch_size)/batch_size.sum()
+            smry_encode_len = encode_len.sum()
+            smry_nb_words = nb_words.sum()
+            return [smry_loss, smry_encode_len, smry_nb_words]
+
+        # # self._train_with_acc.get_metrics_values = lambda outs, metrics, prefix='': \
+        # #     __get_metrics_values(self._train_with_acc, outs, metrics, prefix)
+        # self._train.get_metrics_values = lambda outs, metrics, prefix='': \
+        #     __get_metrics_values(self._train, outs, metrics, prefix)
+        # self._test.get_metrics_values = lambda outs, metrics, prefix='': \
+        #     __get_metrics_values(self._test, outs, metrics, prefix)
+        # # self._test_with_acc.get_metrics_values = lambda outs, metrics, prefix='': \
+        # #     __get_metrics_values(self._test_with_acc, outs, metrics, prefix)
+
+        # self._train_with_acc.summary_outputs = __summarize_outputs
+        self._train.summarize_outputs = __summary_outputs
+        self._test.summarize_outputs = __summary_outputs
+        # self._test_with_acc.summary_outputs = __summary_outputs
+
+        self.fit = self._Sequential__fit_unweighted
+
+
+class ParallelAttLangModel(Sequential):
+    def __init__(self, vocab_size, embed_dims=128, context_dim=128, attention_len=10,
+                 loss='categorical_crossentropy', optimizer='adam'):
+        super(ParallelAttLangModel, self).__init__()
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dims
+
+        self.optimizer = optimizers.get(optimizer)
+        self.loss = objectives.get(loss)
+        self.loss_fnc = objective_fnc(self.loss)
+
+        self.add(Embedding(input_dim=vocab_size, output_dim=embed_dims))
+        self.add(ParallelAttLayer(input_dim=embed_dims, output_dim=context_dim, attention_len=attention_len))
+        self.add(Dense(input_dim=context_dim, output_dim=vocab_size, activation='softmax'))
+
+    @staticmethod
+    def encode_length(y_true, y_pred, mask):
+        probs_ = T.sum(y_true * y_pred, axis=-1)
+
+        if mask is None:
+            nb_words = y_true.shape[0] * y_true.shape[1]
+            probs = probs_.ravel() + 1.0e-30
+        else:
+            nb_words = mask.sum()
+            probs = probs_[mask.nonzero()] + 1.0e-30
+
+        return T.sum(T.log(1.0/probs)), nb_words
+
+    def train(self, X, y, callbacks, show_metrics, batch_size=128, extra_callbacks=(LangModelLogger(), ),
+              validation_split=0., validation_data=None, shuffle=False, verbose=1):
+        self.fit(X, y, callbacks, show_metrics, batch_size=batch_size, nb_epoch=1, verbose=verbose,
+                 extra_callbacks=extra_callbacks, validation_split=validation_split,
+                 validation_data=validation_data, shuffle=shuffle, show_accuracy=False)
+
+    def train_from_dir(self, dir_, data_regex=re.compile(r'\d{3}.bz2'), callbacks=LangHistory(),
+                       show_metrics=('loss', 'ppl'), *args, **kwargs):
+        train_files_ = [os.path.join(dir_, f) for f in os.listdir(dir_) if data_regex.match(f)]
+        train_files = [f for f in train_files_ if os.path.isfile(f)]
+
+        for f in train_files:
+            logger.info('Loading training data from %s' % f)
+            X = np.loadtxt(f, dtype='int32')
+            # y = np.zeros((X.shape[0], X.shape[1], self.vocab_size), dtype=np.int8)
+            tmp = np.eye(self.vocab_size, dtype='int8')
+            y = tmp[X]
+            # for i in range(X.shape[0]):
+            #     for j in range(X.shape[1]):
+            #         idx = X[i, j]
+            #         y[i, j, idx] = 1
+            logger.info('Training on %s' % f)
+            self.train(X, y, callbacks, show_metrics, *args, **kwargs)
+
+    # noinspection PyMethodOverriding
+    def compile(self, optimizer=None):
+        if optimizer is not None:
+            logger.info('compiling with %s' % optimizer)
+            self.optimizer = optimizers.get(optimizer)
+        # input of model
+        self.X_train = self.get_input(train=True)
+        self.X_test = self.get_input(train=False)
+
+        self.y_train = self.get_output(train=True)
+        self.y_test = self.get_output(train=False)
+
+        # target of model
+        self.y = T.zeros_like(self.y_train)
+
+        self.weights = None
+
+        if hasattr(self.layers[-1], "get_output_mask"):
+            mask = self.layers[-1].get_output_mask()
+        else:
+            mask = None
+
+        train_loss = self.loss_fnc(self.y, self.y_train, mask)
+        test_loss = self.loss_fnc(self.y, self.y_test, mask)
+
+        train_loss.name = 'train_loss'
+        test_loss.name = 'test_loss'
+        self.y.name = 'y'
+
+        # train_accuracy = T.mean(T.eq(T.argmax(self.y, axis=-1), T.argmax(self.y_train, axis=-1)),
+        #                         dtype=theano.config.floatX)
+        # test_accuracy = T.mean(T.eq(T.argmax(self.y, axis=-1), T.argmax(self.y_test, axis=-1)),
+        #                        dtype=theano.config.floatX)
+
+        train_ce, nb_trn_wrd = self.encode_length(self.y, self.y_train, mask)
+        test_ce, nb_tst_wrd = self.encode_length(self.y, self.y_test, mask)
+
+        self.class_mode = 'categorical'
+        self.theano_mode = None
+
+        for r in self.regularizers:
+            train_loss = r(train_loss)
+        updates = self.optimizer.get_updates(self.params, self.constraints, train_loss)
+        updates += self.updates
+
+        train_ins = [self.X_train, self.y]
+        test_ins = [self.X_test, self.y]
+        predict_ins = [self.X_test]
+
+        self._train = theano.function(train_ins, [train_loss, train_ce, nb_trn_wrd], updates=updates,
+                                      allow_input_downcast=True)
+        self._train.out_labels = ['loss', 'encode_len', 'nb_words']
+        # self._predict = theano.function(predict_ins, self.y_test, allow_input_downcast=True)
+        # self._predict.out_labels = ['predicted']
+        self._test = theano.function(test_ins, [test_loss, test_ce, nb_tst_wrd], allow_input_downcast=True)
+        self._test.out_labels = ['loss', 'encode_len', 'nb_words']
+
+        # self._train_with_acc = theano.function(train_ins, [train_loss, train_accuracy, train_ce, nb_trn_wrd],
+        #                                        updates=updates,
+        #                                        allow_input_downcast=True, mode=theano_mode)
+        # self._test_with_acc = theano.function(test_ins, [test_loss, test_accuracy],
+        #                                       allow_input_downcast=True, mode=theano_mode)
+
+        # self.__compile_fncs(train_ins, train_loss, test_ins, test_loss, predict_ins, updates)
+
+        self.all_metrics = ['loss', 'ppl', 'val_loss', 'val_ppl']
+
+        # self._train.label2idx = dict((l, idx) for idx, l in enumerate(['loss', 'encode_len', 'nb_words']))
+        # self._test.label2idx = dict((l, idx) for idx, l in enumerate(['loss', 'encode_len', 'nb_words']))
+        #
+        # def __get_metrics_values(f, outs, metrics, prefix=''):
+        #     ret = []
+        #     label2idx = f.label2idx
+        #     for mtrx in metrics:
+        #         if mtrx == 'loss':
+        #             idx = label2idx[mtrx]
+        #             ret.append((prefix+mtrx, outs[idx]))
+        #         elif mtrx == 'ppl':
+        #             nb_words = outs[label2idx['nb_words']]
+        #             encode_len = outs[label2idx['encode_len']]
+        #             ret.append((prefix+'ppl', math.exp(float(encode_len)/float(nb_words))))
+        #         else:
+        #             logger.warn('Specify UNKNOWN metrics ignored')
+        #     return ret
+
+        def __summary_outputs(outs, batch_sizes):
+            out = np.array(outs, dtype=theano.config.floatX)
+            loss, encode_len, nb_words = out
+            batch_size = np.array(batch_sizes, dtype=theano.config.floatX)
+
+            smry_loss = np.sum(loss * batch_size)/batch_size.sum()
+            smry_encode_len = encode_len.sum()
+            smry_nb_words = nb_words.sum()
+            return [smry_loss, smry_encode_len, smry_nb_words]
+
+        # # self._train_with_acc.get_metrics_values = lambda outs, metrics, prefix='': \
+        # #     __get_metrics_values(self._train_with_acc, outs, metrics, prefix)
+        # self._train.get_metrics_values = lambda outs, metrics, prefix='': \
+        #     __get_metrics_values(self._train, outs, metrics, prefix)
+        # self._test.get_metrics_values = lambda outs, metrics, prefix='': \
+        #     __get_metrics_values(self._test, outs, metrics, prefix)
+        # # self._test_with_acc.get_metrics_values = lambda outs, metrics, prefix='': \
+        # #     __get_metrics_values(self._test_with_acc, outs, metrics, prefix)
+
+        # self._train_with_acc.summary_outputs = __summarize_outputs
+        self._train.summarize_outputs = __summary_outputs
+        self._test.summarize_outputs = __summary_outputs
+        # self._test_with_acc.summary_outputs = __summary_outputs
+
+        self.fit = self._Sequential__fit_unweighted
+
 
 def slice_X(X, start_, end_=None, axis=1):
     if end_ is None:

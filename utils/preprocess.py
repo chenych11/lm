@@ -191,7 +191,7 @@ def grouped_sentences(binary_corpus='../data/corpus/wiki-sg-norm-lc-drop-bin.bz2
             sents = np.frombuffer(f.read(siz), dtype=np.uint32)
             # noinspection PyTypeChecker
             sents_ = np.reshape(sents, shape)
-            yield sents_
+            yield sents_.copy().astype('int32')
 
 
 def show_grouped_sentences(group_sents, wordmap='../data/wiki-wordmap.wp'):

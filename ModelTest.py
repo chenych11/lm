@@ -43,8 +43,13 @@ parser.add_option("-g", "--unigram",
                   action="store_true", dest="unigram", default=False,
                   help="Whether use unigram distribution for noise samples")
 parser.add_option("-z", "--optimizer", type='str',
-                  dest="optimizer", default='sgd',
+                  dest="optimizer", default='adam',
                   help="Specify optimizer")
+parser.add_option('-a', "--attention", dest="attention", type='str', default='none',
+                  help='Specify attention model')
+parser.add_option('-l', '--attention-length', dest='att_len', type='int', default=10,
+                  help='Specify attention bias length')
+
 options, args = parser.parse_args()
 # ====================================================================================
 # if TESTLM environment variable is defined, run the program on a small data set.
@@ -69,11 +74,7 @@ else:
 
 if options.train_simple:
     logging.info('Train simple language model')
-    model = SimpleLangModel(vocab_size=15, optimizer=options.optimizer)
-    model.add(model.WordEmbedding(embed_dim=128))
-    model.add(model.LangLSTM(out_dim=128))
-    # model.add(Dropout(0.5))
-    model.add(Dense(input_dim=128, output_dim=15, activation='softmax'))
+    model = SimpleLangModel(vocab_size=15, embed_dims=128, context_dims=128, optimizer=options.optimizer)
     model.compile()
     model.train_from_dir(data_path, validation_split=0.05, batch_size=options.batch_size, verbose=options.verbose)
 
@@ -87,7 +88,7 @@ if options.train_nce:
 
 if options.train_nce1:
     logging.info('Train NCE based language model (1)')
-    model = NCELangModelV1(vocab_size=15, nb_negative=2, embed_dims=128, negprob_table=negprob_table,
+    model = NCELangModelV1(vocab_size=15, nb_negative=6, embed_dims=128, negprob_table=negprob_table,
                            optimizer=options.optimizer)
     model.compile()
     logging.debug('compile success')
@@ -110,5 +111,19 @@ if options.tree:
 
     model = TreeLangModel(vocab_size=15, embed_dim=128, cntx_dim=128, word2class=word2cls, word2bitstr=word2bitstr)
     model.compile(optimizer=options.optimizer)
+    logging.debug('compile success')
+    model.train_from_dir(data_path, validation_split=0.05, batch_size=options.batch_size, verbose=options.verbose)
+
+if options.attention == 'simple':
+    from models import SimpAttLangModel
+    model = SimpAttLangModel(vocab_size=15, embed_dims=128, context_dim=128, attention_len=options.att_len)
+    model.compile()
+    logging.debug('compile success')
+    model.train_from_dir(data_path, validation_split=0.05, batch_size=options.batch_size, verbose=options.verbose)
+
+if options.attention == 'parallel':
+    from models import ParallelAttLangModel
+    model = ParallelAttLangModel(vocab_size=15, embed_dims=128, context_dim=128, attention_len=options.att_len)
+    model.compile()
     logging.debug('compile success')
     model.train_from_dir(data_path, validation_split=0.05, batch_size=options.batch_size, verbose=options.verbose)

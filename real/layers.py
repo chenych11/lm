@@ -1,0 +1,551 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+__author__ = 'Yunchuan Chen'
+from keras.layers.core import Layer, LayerList, Dense, MultiInputLayer
+from keras.layers.embeddings import Embedding
+from keras.layers.recurrent import Recurrent
+from keras import constraints, regularizers
+from keras import initializations, activations
+import theano
+import theano.tensor as T
+import theano.sparse as tsp
+import numpy as np
+from keras.utils.theano_utils import shared_zeros
+from utils import floatX as float_t
+
+
+class LangLSTMLayer(Recurrent):
+    """ Modified from LSTMLayer: adaptation for Language modelling
+        optimized version: Not using mask in _step function and tensorized computation.
+        Acts as a spatiotemporal projection,
+        turning a sequence of vectors into a single vector.
+
+        Eats inputs with shape:
+        (nb_samples, max_sample_length (samples shorter than this are padded with zeros at the end), input_dim)
+
+        and returns outputs with shape:
+        if not return_sequences:
+            (nb_samples, output_dim)
+        if return_sequences:
+            (nb_samples, max_sample_length, output_dim)
+
+        For a step-by-step description of the algorithm, see:
+        http://deeplearning.net/tutorial/lstm.html
+
+        References:
+            Long short-term memory (original 97 paper)
+                http://deeplearning.cs.cmu.edu/pdfs/Hochreiter97_lstm.pdf
+            Learning to forget: Continual prediction with LSTM
+                http://www.mitpressjournals.org/doi/pdf/10.1162/089976600300015015
+            Supervised sequence labelling with recurrent neural networks
+                http://www.cs.toronto.edu/~graves/preprint.pdf
+    """
+
+    def __init__(self, input_dim, output_dim=128, train_init_cell=True, train_init_h=True,
+                 init='glorot_uniform', inner_init='orthogonal', forget_bias_init='one',
+                 input_activation='tanh', gate_activation='hard_sigmoid', output_activation='tanh',
+                 weights=None, truncate_gradient=-1):
+
+        super(LangLSTMLayer, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.truncate_gradient = truncate_gradient
+        self.init = initializations.get(init)
+        self.inner_init = initializations.get(inner_init)
+        self.forget_bias_init = initializations.get(forget_bias_init)
+        self.input_activation = activations.get(input_activation)
+        self.gate_activation = activations.get(gate_activation)
+        self.output_activation = activations.get(output_activation)
+        self.input = T.tensor3()
+        self.time_range = None
+
+        W_z = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_z = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_z = shared_zeros(self.output_dim)
+
+        W_i = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_i = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_i = shared_zeros(self.output_dim)
+
+        W_f = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_f = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_f = self.forget_bias_init(self.output_dim)
+
+        W_o = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_o = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_o = shared_zeros(self.output_dim)
+
+        self.h_m1 = shared_zeros(shape=(1, self.output_dim), name='h0')
+        self.c_m1 = shared_zeros(shape=(1, self.output_dim), name='c0')
+
+        W = np.vstack((W_z[np.newaxis, :, :],
+                       W_i[np.newaxis, :, :],
+                       W_f[np.newaxis, :, :],
+                       W_o[np.newaxis, :, :]))  # shape = (4, input_dim, output_dim)
+        R = np.vstack((R_z[np.newaxis, :, :],
+                       R_i[np.newaxis, :, :],
+                       R_f[np.newaxis, :, :],
+                       R_o[np.newaxis, :, :]))  # shape = (4, output_dim, output_dim)
+        self.W = theano.shared(W, name='Input to hidden weights (zifo)', borrow=True)
+        self.R = theano.shared(R, name='Recurrent weights (zifo)', borrow=True)
+        self.b = theano.shared(np.zeros(shape=(4, self.output_dim), dtype=theano.config.floatX),
+                               name='bias', borrow=True)
+
+        self.params = [self.W, self.R, self.b]
+        if train_init_cell:
+            self.params.append(self.c_m1)
+        if train_init_h:
+            self.params.append(self.h_m1)
+
+        if weights is not None:
+            self.set_weights(weights)
+
+    def _step(self,
+              Y_t,  # sequence
+              h_tm1, c_tm1,  # output_info
+              R):  # non_sequence
+        # h_mask_tm1 = mask_tm1 * h_tm1
+        # c_mask_tm1 = mask_tm1 * c_tm1
+        G_tm1 = T.dot(h_tm1, R)
+        M_t = Y_t + G_tm1
+        z_t = self.input_activation(M_t[:, 0, :])
+        ifo_t = self.gate_activation(M_t[:, 1:, :])
+        i_t = ifo_t[:, 0, :]
+        f_t = ifo_t[:, 1, :]
+        o_t = ifo_t[:, 2, :]
+        # c_t_cndt = f_t * c_tm1 + i_t * z_t
+        # h_t_cndt = o_t * self.output_activation(c_t_cndt)
+        c_t = f_t * c_tm1 + i_t * z_t
+        h_t = o_t * self.output_activation(c_t)
+        # h_t = mask * h_t_cndt + (1-mask) * h_tm1
+        # c_t = mask * c_t_cndt + (1-mask) * c_tm1
+        return h_t, c_t
+
+    def get_output_mask(self, train=None):
+        return None
+
+    def _get_output_with_mask(self, train=False):
+        X = self.get_input(train)
+        # mask = self.get_padded_shuffled_mask(train, X, pad=0)
+        mask = self.get_input_mask(train=train)
+        ind = T.switch(T.eq(mask[:, -1], 1.), mask.shape[-1], T.argmin(mask, axis=-1)).astype('int32').ravel()
+        max_time = T.max(ind) - 1   # drop the last frame
+        X = X.dimshuffle((1, 0, 2))
+        Y = T.dot(X, self.W) + self.b
+        # h0 = T.unbroadcast(alloc_zeros_matrix(X.shape[1], self.output_dim), 1)
+        h0 = T.repeat(self.h_m1, X.shape[1], axis=0)
+        c0 = T.repeat(self.c_m1, X.shape[1], axis=0)
+
+        [outputs, _], updates = theano.scan(
+            self._step,
+            sequences=Y,
+            outputs_info=[h0, c0],
+            non_sequences=[self.R], n_steps=max_time,
+            truncate_gradient=self.truncate_gradient, strict=True,
+            allow_gc=theano.config.scan.allow_gc)
+
+        res = T.concatenate([h0.dimshuffle('x', 0, 1), outputs], axis=0).dimshuffle((1, 0, 2))
+        return res
+
+    def _get_output_without_mask(self, train=False):
+        X = self.get_input(train)
+        # mask = self.get_padded_shuffled_mask(train, X, pad=0)
+        # mask = self.get_input_mask(train=train)
+        # ind = T.switch(T.eq(mask[:, -1], 1.), mask.shape[-1], T.argmin(mask, axis=-1)).astype('int32')
+        # max_time = T.max(ind)
+        max_time = X.shape[1] - 1  # drop the last frame
+        X = X.dimshuffle((1, 0, 2))
+        Y = T.dot(X, self.W) + self.b
+        # h0 = T.unbroadcast(alloc_zeros_matrix(X.shape[1], self.output_dim), 1)
+        h0 = T.repeat(self.h_m1, X.shape[1], axis=0)
+        c0 = T.repeat(self.c_m1, X.shape[1], axis=0)
+
+        [outputs, _], updates = theano.scan(
+            self._step,
+            sequences=Y,
+            outputs_info=[h0, c0],
+            non_sequences=[self.R], n_steps=max_time,
+            truncate_gradient=self.truncate_gradient, strict=True,
+            allow_gc=theano.config.scan.allow_gc)
+
+        res = T.concatenate([h0.dimshuffle('x', 0, 1), outputs], axis=0).dimshuffle((1, 0, 2))
+        return res
+
+    def get_output(self, train=False):
+        mask = self.get_input_mask(train=train)
+        if mask is None:
+            return self._get_output_without_mask(train=train)
+        else:
+            return self._get_output_with_mask(train=train)
+
+    def set_init_cell_parameter(self, is_param=True):
+        if is_param:
+            if self.c_m1 not in self.params:
+                self.params.append(self.c_m1)
+        else:
+            self.params.remove(self.c_m1)
+
+    def set_init_h_parameter(self, is_param=True):
+        if is_param:
+            if self.h_m1 not in self.params:
+                self.params.append(self.h_m1)
+        else:
+            self.params.remove(self.h_m1)
+
+    def get_time_range(self, train):
+        mask = self.get_input_mask(train=train)
+        ind = T.switch(T.eq(mask[:, -1], 1.), mask.shape[-1], T.argmin(mask, axis=-1)).astype('int32')
+        self.time_range = ind
+        return ind
+
+    def get_config(self):
+        return {"name": self.__class__.__name__,
+                "input_dim": self.input_dim,
+                "output_dim": self.output_dim,
+                "init": self.init.__name__,
+                "inner_init": self.inner_init.__name__,
+                "forget_bias_init": self.forget_bias_init.__name__,
+                "input_activation": self.input_activation.__name__,
+                "gate_activation": self.gate_activation.__name__,
+                "truncate_gradient": self.truncate_gradient}
+
+
+class Identity(Layer):
+    # todo: mask support
+    def __init__(self, inputs):
+        super(Identity, self).__init__()
+        self.inputs = inputs
+
+    def get_output(self, train=False):
+        return self.inputs[train]
+
+    def get_input(self, train=False):
+        return self.inputs[train]
+
+
+class Split(LayerList):
+    def __init__(self, split_at, split_axis=-1, keep_dim=False, slot_names=('head', 'tail')):
+        """ Split a layer into to parallel layers.
+            :param split_at: the index to split the layer. the first layer is 0:split_at, the second layer is split_at:
+            :param split_axis: split axis.
+        """
+        super(Split, self).__init__()
+        self.split_axis = split_axis
+        self.split_at = split_at
+        self.input_layer = None
+        self.output_layer_names = slot_names
+        self.input_layer_names = ['whole']
+        self.__output_slots = []
+        self.keep_dim = keep_dim or (abs(split_at) > 1)
+
+    @property
+    def nb_output(self):
+        return 2
+
+    @property
+    def nb_input(self):
+        return 1
+
+    def set_inputs(self, inputs):
+        super(Split, self).set_inputs(inputs)
+        self.input_layer = self.input_layers[0]
+        self.get_output_layers()
+
+    # def _set_input(self, idx, layer):
+    #     raise NotImplementedError('The input layer must be given at instance construction time')
+
+    def get_output_layers(self):
+        if self.output_layers:
+            return self.output_layers
+        out0, out1 = self.get_output_slots()
+        layer0 = Identity(out0)
+        layer1 = Identity(out1)
+        self.output_layers = [layer0, layer1]
+        return self.output_layers
+
+    def get_output_slots(self):
+        # todo: mask support
+        single = True if abs(self.split_at) == 1 else False
+        if self.__output_slots:
+            return self.__output_slots
+        out = self.input_layer.get_output(train=True)
+        if self.split_at >= 0:
+            sz0 = self.split_at
+            sz1 = out.shape[self.split_axis] - sz0
+        else:
+            sz0 = out.shape[self.split_axis] + self.split_at
+            sz1 = -self.split_at
+        split_size = T.stack([sz0, sz1]).flatten()
+        out0trn, out1trn = T.split(out, split_size, n_splits=2, axis=self.split_axis)
+        if not self.keep_dim and single:
+            newshape = T.concatenate([out0trn.shape[:self.split_axis], out0trn.shape[self.split_axis+1:]])
+            if self.split_at == 1:
+                out0trn = T.reshape(out0trn, newshape, ndim=out0trn.ndim-1)
+            else:
+                out1trn = T.reshape(out1trn, newshape, ndim=out1trn.ndim-1)
+
+        out = self.input_layer.get_output(train=False)
+        if self.split_at >= 0:
+            sz0 = self.split_at
+            sz1 = out.shape[self.split_axis] - sz0
+        else:
+            sz0 = out.shape[self.split_axis] + self.split_at
+            sz1 = -self.split_at
+        split_size = T.stack([sz0, sz1]).flatten()
+        out0tst, out1tst = T.split(out, split_size, n_splits=2, axis=self.split_axis)
+        if not self.keep_dim and single:
+            newshape = T.concatenate([out0tst.shape[:self.split_axis], out0tst.shape[self.split_axis+1:]])
+            if self.split_at == 1:
+                out0tst = T.reshape(out0tst, newshape, ndim=out0tst.ndim-1)
+            else:
+                out1tst = T.reshape(out1tst, newshape, ndim=out1tst.ndim-1)
+        # out0tst = T.addbroadcast(out0tst, *self.broadcastable_axes[0])
+        # out1tst = T.addbroadcast(out1tst, *self.broadcastable_axes[1])
+
+        out0 = {True: out0trn, False: out0tst}
+        out1 = {True: out1trn, False: out1tst}
+
+        self.__output_slots = (out0, out1)
+        return out0, out1
+
+
+class PartialSoftmax(Dense, MultiInputLayer):
+    def __init__(self, input_dim, output_dim, init='glorot_uniform', weights=None, name=None,
+                 W_regularizer=None, b_regularizer=None, activity_regularizer=None,
+                 W_constraint=None, b_constraint=None):
+        MultiInputLayer.__init__(self, slot_names=['idxes', 'features'])
+        Dense.__init__(self, input_dim, output_dim, init=init, weights=weights, name=name, W_regularizer=W_regularizer,
+                       b_regularizer=b_regularizer, activity_regularizer=activity_regularizer,
+                       W_constraint=W_constraint, b_constraint=b_constraint)
+
+        self.__input_slots = None
+
+    def get_input(self, train=False):
+        if self.__input_slots is None:
+            self.__input_slots = {True: dict((name, layer.get_output(True)) for name, layer in
+                                             zip(self.input_layer_names, self.input_layers)),
+                                  False: dict((name, layer.get_output(False)) for name, layer in
+                                              zip(self.input_layer_names, self.input_layers))}
+        return self.__input_slots[train]
+
+    def get_output(self, train=False):
+        ins = self.get_input(train)
+        idxes = ins['idxes']
+        features = ins['features']
+        weights = self.W.T.take(idxes, axis=0)
+        bias = self.b.T.take(idxes, axis=0)
+        return T.exp(T.sum(weights * features, axis=-1) + bias)
+
+
+class PartialSoftmaxV4(Dense, MultiInputLayer):
+    def __init__(self, input_dim, base_size, init='glorot_uniform', weights=None, name=None,
+                 W_regularizer=None, b_regularizer=None, activity_regularizer=None,
+                 W_constraint=None, b_constraint=None):
+        MultiInputLayer.__init__(self, slot_names=['idxes', 'sparse_codings', 'features'])
+        Dense.__init__(self, base_size, input_dim, init=init, weights=weights, name=name, W_regularizer=W_regularizer,
+                       b_regularizer=b_regularizer, activity_regularizer=activity_regularizer,
+                       W_constraint=W_constraint, b_constraint=b_constraint)
+        self.params.remove(self.b)
+        self.b = shared_zeros((base_size, 1), dtype=float_t)
+        self.params.append(self.b)
+
+        self.__input_slots = None
+
+    def get_input(self, train=False):
+        if self.__input_slots is None:
+            self.__input_slots = {True: dict((name, layer.get_output(True)) for name, layer in
+                                             zip(self.input_layer_names, self.input_layers)),
+                                  False: dict((name, layer.get_output(False)) for name, layer in
+                                              zip(self.input_layer_names, self.input_layers))}
+        return self.__input_slots[train]
+
+    def get_output(self, train=False):
+        ins = self.get_input(train)
+        idxes = ins['idxes']
+        sparse_codings = ins['sparse_codings']  # (M, B+1)
+        features = ins['features']   # (ns, nt, dl)
+        detectors_flat = tsp.structured_dot(sparse_codings, self.W)   # (M, dl)
+        bias_flat = tsp.structured_dot(sparse_codings, self.b)
+        bias = T.reshape(bias_flat, idxes.shape, ndim=idxes.ndim)
+        detec_shape = T.concatenate([idxes.shape, [-1]])
+        detectors = T.reshape(detectors_flat, detec_shape, ndim=idxes.ndim+1)   # (ns, nt, dl)
+        return T.exp(T.sum(detectors * features, axis=-1) + bias)
+        # return T.exp(T.sum(detectors * features, axis=-1))
+
+
+class SharedWeightsDense(Layer):
+    def __init__(self, W, b, sparse_codes, activation='linear'):
+        super(SharedWeightsDense, self).__init__()
+        self.params = []
+        self.W = W
+        self.b = b
+        self.__input_slots = None
+        self.sparse_codes = tsp.as_sparse_variable(sparse_codes)
+        self.activation = activations.get(activation)
+
+    def get_output(self, train=False):
+        ins = self.get_input(train)
+        W = tsp.structured_dot(self.sparse_codes, self.W).T
+        b = tsp.structured_dot(self.sparse_codes, self.b).T
+        b = T.addbroadcast(b, 0)
+        return self.activation(T.dot(ins, W) + b)
+
+
+class LookupProb(Layer):
+    def __init__(self, table):
+        super(LookupProb, self).__init__()
+        self.table = table
+
+    def get_output(self, train=False):
+        idxes = self.get_input(train)
+        return self.table[idxes]
+
+
+class PartialSoftmaxV1(Dense, MultiInputLayer):
+    def __init__(self, input_dim, output_dim, init='glorot_uniform', weights=None, name=None,
+                 W_regularizer=None, b_regularizer=None, activity_regularizer=None,
+                 W_constraint=None, b_constraint=None):
+        MultiInputLayer.__init__(self, slot_names=['unique_idxes', 'poses', 'features'])
+        Dense.__init__(self, input_dim, output_dim, init=init, weights=weights, name=name, W_regularizer=W_regularizer,
+                       b_regularizer=b_regularizer, activity_regularizer=activity_regularizer,
+                       W_constraint=W_constraint, b_constraint=b_constraint)
+
+    def get_input(self, train=False):
+        return dict((name, layer.get_output(train)) for name, layer in zip(self.input_layer_names, self.input_layers))
+
+    def get_output(self, train=False):
+        ins = self.get_input(train)
+        idxes = ins['unique_idxes']
+        poses = ins['poses']
+        features = ins['features']
+        weights_ = self.W.T.take(idxes, axis=0)
+        bias_ = self.b.T.take(idxes, axis=0)
+        weights = weights_[poses]
+        bias = bias_[poses]
+        return T.exp(T.sum(weights * features, axis=-1) + bias)
+
+
+class TreeLogSoftmax(Embedding, MultiInputLayer):
+    eps = 10e-37
+
+    def __init__(self, input_dim, embed_dim, init='uniform', W_regularizer=None,
+                 activity_regularizer=None, W_constraint=None, weights=None):
+        # The order to call base __init__ functions is important
+        Embedding.__init__(self, input_dim, output_dim=embed_dim, init=init,
+                           W_regularizer=W_regularizer, activity_regularizer=activity_regularizer,
+                           W_constraint=W_constraint, mask_zero=False, weights=weights)
+        # self.b = theano.shared(np.zeros(input_dim, dtype=floatX), borrow=True)
+        # self.params.append(self.b)
+        MultiInputLayer.__init__(self, slot_names=('features', 'cls_idx', 'word_bitstr_mask'))
+
+    def supports_masked_input(self):
+        return True
+
+    def get_output_mask(self, train=None):
+        self.name2layer['features'].get_output_mask(train=train)
+
+    def get_output(self, train=False):
+        ins = self.get_input(train=train)
+        features = ins['features']
+        cls_idx = ins['cls_idx']
+        word_bits_mask = ins['word_bitstr_mask']
+
+        node_embeds = self.W[cls_idx]                           # (n_s, n_t, n_n, d_l)
+        # node_bias = self.b[cls_idx]                           # (n_s, n_t, n_n)
+        features = features.dimshuffle(0, 1, 'x', 2)            # (n_s, n_t, 1,   d_l)
+        # score = T.sum(features * node_embeds, axis=-1) + node_bias         # (n_s, n_t, n_n)
+        score = T.sum(features * node_embeds, axis=-1)          # (n_s, n_t, n_n)
+        prob_ = T.nnet.sigmoid(score * word_bits_mask)          # (n_s, n_t, n_n)
+        prob = T.switch(T.eq(word_bits_mask, 0.0), 1.0, prob_)  # (n_s, n_t, n_n)
+        log_prob = T.sum(T.log(self.eps+prob), axis=-1)         # (n_s, n_t)
+        return log_prob
+
+    def get_config(self):
+        return {"name": self.__class__.__name__,
+                "input_dim": self.input_dim,
+                "output_dim": self.output_dim,
+                "input_slot_names": self.input_layer_names,
+                "init": self.init.__name__,
+                "activity_regularizer": self.activity_regularizer.get_config() if self.activity_regularizer else None,
+                "W_regularizer": self.W_regularizer.get_config() if self.W_regularizer else None,
+                "W_constraint": self.W_constraint.get_config() if self.W_constraint else None}
+
+
+class SparseEmbedding(MultiInputLayer):
+    """
+        Turn positive integers (indexes) into denses vectors of fixed size.
+        eg. [[4], [20]] -> [[0.25, 0.1], [0.6, -0.2]]
+
+        @input_dim: size of vocabulary (highest input integer + 1)
+        @out_dim: size of dense representation
+    """
+    def __init__(self, input_dim, output_dim, init='uniform',
+                 W_regularizer=None, activity_regularizer=None, W_constraint=None, weights=None):
+
+        # super(Embedding, self).__init__()
+        MultiInputLayer.__init__(self, slot_names=['codes', 'shape'])
+        self.init = initializations.get(init)
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+
+        codes = tsp.csr_matrix('sparse-codes', dtype=float_t)
+        shape = T.ivector('sents-shape')
+
+        self.set_previous(layers=[Identity(inputs={True: codes, False: codes}),
+                                  Identity(inputs={True: shape, False: shape})])
+
+        self.W = self.init((self.input_dim, self.output_dim))
+
+        self.params = [self.W]
+
+        self.W_constraint = constraints.get(W_constraint)
+        self.constraints = [self.W_constraint]
+
+        self.regularizers = []
+
+        self.W_regularizer = regularizers.get(W_regularizer)
+        if self.W_regularizer:
+            self.W_regularizer.set_param(self.W)
+            self.regularizers.append(self.W_regularizer)
+
+        self.activity_regularizer = regularizers.get(activity_regularizer)
+        if self.activity_regularizer:
+            self.activity_regularizer.set_layer(self)
+            self.regularizers.append(self.activity_regularizer)
+
+        if weights is not None:
+            self.set_weights(weights)
+
+        self.__output_slots = None
+
+    def get_output_mask(self, train=False):
+        return None
+
+    def supports_masked_input(self):
+        return False
+
+    def get_output(self, train=False):
+        if self.__output_slots is None:
+            train_in = self.get_input(True)
+            test_in = self.get_input(False)
+            trn_codes = train_in['codes']
+            trn_shape = T.concatenate([train_in['shape'], np.array([-1], dtype=train_in['shape'].dtype)])
+            tst_codes = test_in['codes']
+            tst_shape = T.concatenate([test_in['shape'], np.array([-1], dtype=test_in['shape'].dtype)])
+
+            trn_features = tsp.structured_dot(trn_codes, self.W)
+            tst_features = tsp.structured_dot(tst_codes, self.W)
+
+            self.__output_slots = {True: T.reshape(trn_features, trn_shape, ndim=trn_features.ndim+1),
+                                   False: T.reshape(tst_features, tst_shape, ndim=tst_features.ndim+1)}
+        out = self.__output_slots[train]
+        return out
+
+    def get_config(self):
+        return {"name": self.__class__.__name__,
+                "input_dim": self.input_dim,
+                "output_dim": self.output_dim,
+                "init": self.init.__name__,
+                "activity_regularizer": self.activity_regularizer.get_config() if self.activity_regularizer else None,
+                "W_regularizer": self.W_regularizer.get_config() if self.W_regularizer else None,
+                "W_constraint": self.W_constraint.get_config() if self.W_constraint else None}
