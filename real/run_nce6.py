@@ -5,7 +5,8 @@ __author__ = 'Yunchuan Chen'
 from utils import get_unigram_probtable
 import optparse
 from keras.optimizers import adam, AdamAnneal
-from models import NCELangModel
+from models import NCELangModelV6
+import cPickle as pickle
 
 DATA_PATH = '../data/corpus/wiki-sg-norm-lc-drop-bin.bz2'
 NB_RUN_WORDS = 100000000
@@ -19,8 +20,10 @@ parser.add_option("-a", "--lr", type="float", dest="lr", default=0.01,
                   help="learning rate")
 parser.add_option("-R", "--running-words", type="int", dest="running_words", default=NB_RUN_WORDS,
                   help="amount of training data (number of words)")
-parser.add_option("-V", "--vocab-size", type="int", dest="vocab_size", default=NB_VOCAB,
-                  help="vocabulary size")
+parser.add_option("-S", "--coding-file", type="str", dest="coding_file",
+                  help="sparse coding file (pickle)")
+parser.add_option("-e", "--embedding-file", type="str", dest="embedding_file",
+                  help="initial embedding file (pickle)")
 parser.add_option("-m", "--val-run", type="int", dest="val_run", default=NB_RUN_VAL,
                   help="running validation words")
 parser.add_option("-n", "--nb-evaluation", type="int", dest="nb_evaluation", default=NB_EVALUATE,
@@ -33,8 +36,6 @@ parser.add_option("-d", "--decay", action="store_true", dest="decay", default=Fa
                   help="decay lr or not")
 parser.add_option("-N", "--nb-negative", type="int", dest="negative", default=50,
                   help="amount of training data (number of words)")
-parser.add_option("-C", "--context-size", type="int", dest="context_size", default=128,
-                  help="amount of training data (number of words)")
 parser.add_option("-E", "--embedding-size", type="int", dest="embed_size", default=128,
                   help="amount of training data (number of words)")
 parser.add_option("-l", "--log-file", type="str", dest="log_file", default='',
@@ -43,17 +44,36 @@ parser.add_option("-r", "--report-interval", type="float", dest="interval", defa
                   help="decaying rate")
 parser.add_option("-s", "--save", type="str", dest="save", default='',
                   help="amount of training data (number of words)")
+parser.add_option("-p", "--init", type="str", dest="init", default='first',
+                  help="init scheme")
 options, args = parser.parse_args()
 
 nb_run_words = options.running_words
-nb_vocab = options.vocab_size
 nb_run_val = options.val_run
 nb_evaluate = options.nb_evaluation
 
-# unigram_table = get_unigram_probtable(nb_words=nb_vocab)
-unigram_table = get_unigram_probtable(nb_words=nb_vocab,
-                                      save_path='../data/wiki-unigram-prob-size%d.pkl' %
-                                                nb_vocab)
+
+with file(options.coding_file, 'rb') as f:
+    sparse_coding = pickle.load(f)
+    # print sparse_coding.dtype
+
+nb_vocab = sparse_coding.shape[0]
+unigram_table = get_unigram_probtable(nb_words=nb_vocab, save_path='../data/wiki-unigram-prob-size%d.pkl' % nb_vocab)
+
+if options.embedding_file != '':
+    with file(options.embedding_file, 'rb') as f:
+        ini_embeds = pickle.load(f)
+
+    if options.init == 'first':
+        init_e = [ini_embeds]
+    else:
+        init_e = [ini_embeds] * 4
+    # print ini_embeds.dtype
+    # print ini_embeds.shape
+    # import sys
+    # sys.exit(0)
+else:
+    init_e = None
 
 if options.decay:
     opt = AdamAnneal(lr=options.lr, lr_min=options.lr_min, gamma=options.gamma)
@@ -70,9 +90,9 @@ if options.save == '':
 else:
     save_path = options.save
 
-model = NCELangModel(vocab_size=nb_vocab, nb_negative=options.negative, 
-                     embed_dims=options.embed_size, context_dims=options.context_size,
-                     negprob_table=unigram_table, optimizer=opt)
+model = NCELangModelV6(sparse_coding=sparse_coding, nb_negative=options.negative,
+                       embed_dims=options.embed_size, init_embeddings=init_e,
+                       negprob_table=unigram_table, optimizer=opt)
 model.compile()
 model.train(data_file=DATA_PATH,
             save_path=save_path,

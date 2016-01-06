@@ -210,6 +210,335 @@ class LangLSTMLayer(Recurrent):
                 "truncate_gradient": self.truncate_gradient}
 
 
+class LangLSTMLayerV5(Recurrent):
+    """ Modified from LSTMLayer: do not transform inputs. adaptation for Language modelling
+        optimized version: Not using mask in _step function and tensorized computation.
+        Acts as a spatiotemporal projection,
+        turning a sequence of vectors into a single vector.
+
+        Eats inputs with shape:
+        (nb_samples, max_sample_length (samples shorter than this are padded with zeros at the end), input_dim)
+
+        and returns outputs with shape:
+        if not return_sequences:
+            (nb_samples, output_dim)
+        if return_sequences:
+            (nb_samples, max_sample_length, output_dim)
+
+        For a step-by-step description of the algorithm, see:
+        http://deeplearning.net/tutorial/lstm.html
+
+        References:
+            Long short-term memory (original 97 paper)
+                http://deeplearning.cs.cmu.edu/pdfs/Hochreiter97_lstm.pdf
+            Learning to forget: Continual prediction with LSTM
+                http://www.mitpressjournals.org/doi/pdf/10.1162/089976600300015015
+            Supervised sequence labelling with recurrent neural networks
+                http://www.cs.toronto.edu/~graves/preprint.pdf
+    """
+
+    def __init__(self, embed_dim, train_init_cell=True, train_init_h=True,
+                 init='glorot_uniform', inner_init='orthogonal', forget_bias_init='one',
+                 input_activation='tanh', gate_activation='hard_sigmoid', output_activation='tanh',
+                 weights=None, truncate_gradient=-1):
+
+        super(LangLSTMLayerV5, self).__init__()
+        self.input_dim = embed_dim
+        self.output_dim = embed_dim
+        self.truncate_gradient = truncate_gradient
+        self.init = initializations.get(init)
+        self.inner_init = initializations.get(inner_init)
+        self.forget_bias_init = initializations.get(forget_bias_init)
+        self.input_activation = activations.get(input_activation)
+        self.gate_activation = activations.get(gate_activation)
+        self.output_activation = activations.get(output_activation)
+        self.input = T.tensor3()
+        self.time_range = None
+
+        # W_z = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_z = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_z = shared_zeros(self.output_dim)
+
+        # W_i = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_i = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_i = shared_zeros(self.output_dim)
+
+        # W_f = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_f = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_f = self.forget_bias_init(self.output_dim)
+
+        # W_o = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_o = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_o = shared_zeros(self.output_dim)
+
+        self.h_m1 = shared_zeros(shape=(1, self.output_dim), name='h0')
+        self.c_m1 = shared_zeros(shape=(1, self.output_dim), name='c0')
+
+        # W = np.vstack((W_z[np.newaxis, :, :],
+        #                W_i[np.newaxis, :, :],
+        #                W_f[np.newaxis, :, :],
+        #                W_o[np.newaxis, :, :]))  # shape = (4, input_dim, output_dim)
+        R = np.vstack((R_z[np.newaxis, :, :],
+                       R_i[np.newaxis, :, :],
+                       R_f[np.newaxis, :, :],
+                       R_o[np.newaxis, :, :]))  # shape = (4, output_dim, output_dim)
+        # self.W = theano.shared(W, name='Input to hidden weights (zifo)', borrow=True)
+        self.R = theano.shared(R, name='Recurrent weights (zifo)', borrow=True)
+        self.b = theano.shared(np.zeros(shape=(4, self.output_dim), dtype=theano.config.floatX),
+                               name='bias', borrow=True)
+
+        # self.params = [self.W, self.R, self.b]
+        self.params = [self.R, self.b]
+        if train_init_cell:
+            self.params.append(self.c_m1)
+        if train_init_h:
+            self.params.append(self.h_m1)
+
+        if weights is not None:
+            self.set_weights(weights)
+
+    def _step(self,
+              Y_t,  # sequence
+              h_tm1, c_tm1,  # output_info
+              R):  # non_sequence
+        G_tm1 = T.dot(h_tm1, R)
+        M_t = Y_t + G_tm1
+        z_t = self.input_activation(M_t[:, 0, :])
+        ifo_t = self.gate_activation(M_t[:, 1:, :])
+        i_t = ifo_t[:, 0, :]
+        f_t = ifo_t[:, 1, :]
+        o_t = ifo_t[:, 2, :]
+        c_t = f_t * c_tm1 + i_t * z_t
+        h_t = o_t * self.output_activation(c_t)
+
+        return h_t, c_t
+
+    def get_output_mask(self, train=None):
+        return None
+
+    def _get_output_without_mask(self, train=False):
+        X = self.get_input(train)
+        max_time = X.shape[1] - 1  # drop the last frame
+        X = X.dimshuffle((1, 0, 2))
+        Y = X.dimshuffle((0, 1, 'x', 2)) + self.b
+        h0 = T.repeat(self.h_m1, X.shape[1], axis=0)
+        c0 = T.repeat(self.c_m1, X.shape[1], axis=0)
+
+        [outputs, _], updates = theano.scan(
+            self._step,
+            sequences=Y,
+            outputs_info=[h0, c0],
+            non_sequences=[self.R], n_steps=max_time,
+            truncate_gradient=self.truncate_gradient, strict=True,
+            allow_gc=theano.config.scan.allow_gc)
+
+        res = T.concatenate([h0.dimshuffle('x', 0, 1), outputs], axis=0).dimshuffle((1, 0, 2))
+        return res
+
+    def get_output(self, train=False):
+        mask = self.get_input_mask(train=train)
+        if mask is None:
+            return self._get_output_without_mask(train=train)
+        else:
+            raise NotImplementedError('mask not supported yet')
+
+    def set_init_cell_parameter(self, is_param=True):
+        if is_param:
+            if self.c_m1 not in self.params:
+                self.params.append(self.c_m1)
+        else:
+            self.params.remove(self.c_m1)
+
+    def set_init_h_parameter(self, is_param=True):
+        if is_param:
+            if self.h_m1 not in self.params:
+                self.params.append(self.h_m1)
+        else:
+            self.params.remove(self.h_m1)
+
+    def get_time_range(self, train):
+        mask = self.get_input_mask(train=train)
+        ind = T.switch(T.eq(mask[:, -1], 1.), mask.shape[-1], T.argmin(mask, axis=-1)).astype('int32')
+        self.time_range = ind
+        return ind
+
+    def get_config(self):
+        return {"name": self.__class__.__name__,
+                "input_dim": self.input_dim,
+                "output_dim": self.output_dim,
+                "init": self.init.__name__,
+                "inner_init": self.inner_init.__name__,
+                "forget_bias_init": self.forget_bias_init.__name__,
+                "input_activation": self.input_activation.__name__,
+                "gate_activation": self.gate_activation.__name__,
+                "truncate_gradient": self.truncate_gradient}
+
+
+class LangLSTMLayerV6(Recurrent):
+    """ Modified from LSTMLayer: do not transform inputs. adaptation for Language modelling
+        optimized version: Not using mask in _step function and tensorized computation.
+        Acts as a spatiotemporal projection,
+        turning a sequence of vectors into a single vector.
+
+        Eats inputs with shape:
+        (nb_samples, max_sample_length (samples shorter than this are padded with zeros at the end), input_dim)
+
+        and returns outputs with shape:
+        if not return_sequences:
+            (nb_samples, output_dim)
+        if return_sequences:
+            (nb_samples, max_sample_length, output_dim)
+
+        For a step-by-step description of the algorithm, see:
+        http://deeplearning.net/tutorial/lstm.html
+
+        References:
+            Long short-term memory (original 97 paper)
+                http://deeplearning.cs.cmu.edu/pdfs/Hochreiter97_lstm.pdf
+            Learning to forget: Continual prediction with LSTM
+                http://www.mitpressjournals.org/doi/pdf/10.1162/089976600300015015
+            Supervised sequence labelling with recurrent neural networks
+                http://www.cs.toronto.edu/~graves/preprint.pdf
+    """
+
+    def __init__(self, embed_dim, train_init_cell=True, train_init_h=True,
+                 init='glorot_uniform', inner_init='orthogonal', forget_bias_init='one',
+                 input_activation='tanh', gate_activation='hard_sigmoid', output_activation='tanh',
+                 weights=None, truncate_gradient=-1):
+
+        super(LangLSTMLayerV6, self).__init__()
+        self.input_dim = embed_dim
+        self.output_dim = embed_dim
+        self.truncate_gradient = truncate_gradient
+        self.init = initializations.get(init)
+        self.inner_init = initializations.get(inner_init)
+        self.forget_bias_init = initializations.get(forget_bias_init)
+        self.input_activation = activations.get(input_activation)
+        self.gate_activation = activations.get(gate_activation)
+        self.output_activation = activations.get(output_activation)
+        self.input = T.tensor3()
+        self.time_range = None
+
+        # W_z = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_z = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_z = shared_zeros(self.output_dim)
+
+        # W_i = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_i = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_i = shared_zeros(self.output_dim)
+
+        # W_f = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_f = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_f = self.forget_bias_init(self.output_dim)
+
+        # W_o = self.init((self.input_dim, self.output_dim)).get_value(borrow=True)
+        R_o = self.inner_init((self.output_dim, self.output_dim)).get_value(borrow=True)
+        # self.b_o = shared_zeros(self.output_dim)
+
+        self.h_m1 = shared_zeros(shape=(1, self.output_dim), name='h0')
+        self.c_m1 = shared_zeros(shape=(1, self.output_dim), name='c0')
+
+        # W = np.vstack((W_z[np.newaxis, :, :],
+        #                W_i[np.newaxis, :, :],
+        #                W_f[np.newaxis, :, :],
+        #                W_o[np.newaxis, :, :]))  # shape = (4, input_dim, output_dim)
+        R = np.vstack((R_z[np.newaxis, :, :],
+                       R_i[np.newaxis, :, :],
+                       R_f[np.newaxis, :, :],
+                       R_o[np.newaxis, :, :]))  # shape = (4, output_dim, output_dim)
+        # self.W = theano.shared(W, name='Input to hidden weights (zifo)', borrow=True)
+        self.R = theano.shared(R, name='Recurrent weights (zifo)', borrow=True)
+        self.b = theano.shared(np.zeros(shape=(4, self.output_dim), dtype=theano.config.floatX),
+                               name='bias', borrow=True)
+
+        # self.params = [self.W, self.R, self.b]
+        self.params = [self.R, self.b]
+        if train_init_cell:
+            self.params.append(self.c_m1)
+        if train_init_h:
+            self.params.append(self.h_m1)
+
+        if weights is not None:
+            self.set_weights(weights)
+
+    def _step(self,
+              Y_t,  # sequence
+              h_tm1, c_tm1,  # output_info
+              R):  # non_sequence
+        G_tm1 = T.dot(h_tm1, R)
+        M_t = Y_t + G_tm1
+        z_t = self.input_activation(M_t[:, 0, :])
+        ifo_t = self.gate_activation(M_t[:, 1:, :])
+        i_t = ifo_t[:, 0, :]
+        f_t = ifo_t[:, 1, :]
+        o_t = ifo_t[:, 2, :]
+        c_t = f_t * c_tm1 + i_t * z_t
+        h_t = o_t * self.output_activation(c_t)
+
+        return h_t, c_t
+
+    def get_output_mask(self, train=None):
+        return None
+
+    def _get_output_without_mask(self, train=False):
+        X = self.get_input(train)
+        ns = X.shape[0]
+        max_time = X.shape[1] - 1  # drop the last frame
+        X = X.dimshuffle((1, 0, 2, 3))
+        Y = X + self.b
+        h0 = T.repeat(self.h_m1, ns, axis=0)
+        c0 = T.repeat(self.c_m1, ns, axis=0)
+
+        [outputs, _], updates = theano.scan(
+            self._step,
+            sequences=Y,
+            outputs_info=[h0, c0],
+            non_sequences=[self.R], n_steps=max_time,
+            truncate_gradient=self.truncate_gradient, strict=True,
+            allow_gc=theano.config.scan.allow_gc)
+
+        res = T.concatenate([h0.dimshuffle('x', 0, 1), outputs], axis=0).dimshuffle((1, 0, 2))
+        return res
+
+    def get_output(self, train=False):
+        mask = self.get_input_mask(train=train)
+        if mask is None:
+            return self._get_output_without_mask(train=train)
+        else:
+            raise NotImplementedError('mask not supported yet')
+
+    def set_init_cell_parameter(self, is_param=True):
+        if is_param:
+            if self.c_m1 not in self.params:
+                self.params.append(self.c_m1)
+        else:
+            self.params.remove(self.c_m1)
+
+    def set_init_h_parameter(self, is_param=True):
+        if is_param:
+            if self.h_m1 not in self.params:
+                self.params.append(self.h_m1)
+        else:
+            self.params.remove(self.h_m1)
+
+    def get_time_range(self, train):
+        mask = self.get_input_mask(train=train)
+        ind = T.switch(T.eq(mask[:, -1], 1.), mask.shape[-1], T.argmin(mask, axis=-1)).astype('int32')
+        self.time_range = ind
+        return ind
+
+    def get_config(self):
+        return {"name": self.__class__.__name__,
+                "input_dim": self.input_dim,
+                "output_dim": self.output_dim,
+                "init": self.init.__name__,
+                "inner_init": self.inner_init.__name__,
+                "forget_bias_init": self.forget_bias_init.__name__,
+                "input_activation": self.input_activation.__name__,
+                "gate_activation": self.gate_activation.__name__,
+                "truncate_gradient": self.truncate_gradient}
+
+
 class Identity(Layer):
     # todo: mask support
     def __init__(self, inputs):
@@ -549,3 +878,133 @@ class SparseEmbedding(MultiInputLayer):
                 "activity_regularizer": self.activity_regularizer.get_config() if self.activity_regularizer else None,
                 "W_regularizer": self.W_regularizer.get_config() if self.W_regularizer else None,
                 "W_constraint": self.W_constraint.get_config() if self.W_constraint else None}
+
+
+class SparseEmbeddingV6(MultiInputLayer):
+    """
+        Turn positive integers (indexes) into denses vectors of fixed size.
+        eg. [[4], [20]] -> [[0.25, 0.1], [0.6, -0.2]]
+
+        @input_dim: size of vocabulary (highest input integer + 1)
+        @out_dim: size of dense representation
+    """
+    def __init__(self, input_dim, output_dim, init='uniform',
+                 W_regularizer=None, activity_regularizer=None, W_constraint=None, weights=None):
+
+        # super(Embedding, self).__init__()
+        MultiInputLayer.__init__(self, slot_names=['codes', 'shape'])
+        self.init = initializations.get(init)
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+
+        codes = tsp.csr_matrix('sparse-codes', dtype=float_t)
+        shape = T.ivector('sents-shape')
+
+        self.set_previous(layers=[Identity(inputs={True: codes, False: codes}),
+                                  Identity(inputs={True: shape, False: shape})])
+
+        W0 = self.init((self.input_dim, self.output_dim))
+        W1 = self.init((self.input_dim, self.output_dim))
+        W2 = self.init((self.input_dim, self.output_dim))
+        W3 = self.init((self.input_dim, self.output_dim))
+
+        Wi = [None] * 4
+        Wi[0] = W0.get_value()
+        Wi[1] = W1.get_value()
+        Wi[2] = W2.get_value()
+        Wi[3] = W3.get_value()
+
+        if weights is not None:
+            for t, s in zip(Wi, weights):
+                t[:] = s
+
+        W = np.vstack((Wi[0][np.newaxis, :, :],
+                       Wi[1][np.newaxis, :, :],
+                       Wi[2][np.newaxis, :, :],
+                       Wi[3][np.newaxis, :, :]))  # shape = (4, input_dim, output_dim)
+        self.W = theano.shared(W)
+
+        del W0
+        del W1
+        del W2
+        del W3
+
+        self.params = [self.W]
+
+        self.W_constraint = constraints.get(W_constraint)
+        self.constraints = [self.W_constraint]
+
+        self.regularizers = []
+
+        self.W_regularizer = regularizers.get(W_regularizer)
+        if self.W_regularizer:
+            self.W_regularizer.set_param(self.W)
+            self.regularizers.append(self.W_regularizer)
+
+        self.activity_regularizer = regularizers.get(activity_regularizer)
+        if self.activity_regularizer:
+            self.activity_regularizer.set_layer(self)
+            self.regularizers.append(self.activity_regularizer)
+
+        # if weights is not None:
+        #     self.set_weights(weights)
+
+        self.__output_slots = None
+
+    def get_output_mask(self, train=False):
+        return None
+
+    def supports_masked_input(self):
+        return False
+
+    def get_output(self, train=False):
+        if self.__output_slots is None:
+            train_in = self.get_input(True)
+            test_in = self.get_input(False)
+            trn_codes = train_in['codes']
+            trn_shape = T.concatenate([train_in['shape'], np.array([4, -1], dtype=train_in['shape'].dtype)])
+            tst_codes = test_in['codes']
+            tst_shape = T.concatenate([test_in['shape'], np.array([4, -1], dtype=test_in['shape'].dtype)])
+
+            trn_features0 = tsp.structured_dot(trn_codes, self.W[0])
+            trn_features1 = tsp.structured_dot(trn_codes, self.W[1])
+            trn_features2 = tsp.structured_dot(trn_codes, self.W[2])
+            trn_features3 = tsp.structured_dot(trn_codes, self.W[3])
+
+            tst_features0 = tsp.structured_dot(tst_codes, self.W[0])
+            tst_features1 = tsp.structured_dot(tst_codes, self.W[1])
+            tst_features2 = tsp.structured_dot(tst_codes, self.W[2])
+            tst_features3 = tsp.structured_dot(tst_codes, self.W[3])
+
+            trn_features = T.stack([trn_features0, trn_features1, trn_features2, trn_features3], axis=1)
+            tst_features = T.stack([tst_features0, tst_features1, tst_features2, tst_features3], axis=1)
+
+            self.__output_slots = {True: T.reshape(trn_features, trn_shape, ndim=trn_features.ndim+1),
+                                   False: T.reshape(tst_features, tst_shape, ndim=tst_features.ndim+1)}
+        out = self.__output_slots[train]
+        return out
+
+    def get_config(self):
+        return {"name": self.__class__.__name__,
+                "input_dim": self.input_dim,
+                "output_dim": self.output_dim,
+                "init": self.init.__name__,
+                "activity_regularizer": self.activity_regularizer.get_config() if self.activity_regularizer else None,
+                "W_regularizer": self.W_regularizer.get_config() if self.W_regularizer else None,
+                "W_constraint": self.W_constraint.get_config() if self.W_constraint else None}
+
+
+class ActivationLayer(Layer):
+    def __init__(self, name='linear'):
+        super(ActivationLayer, self).__init__()
+        self.name = name
+        self.activation = activations.get(name)
+
+    def get_output(self, train=False):
+        ins = self.get_input(train)
+        return self.activation(ins)
+
+    def get_config(self):
+        w = super(ActivationLayer, self).get_config()
+        w['name'] = self.__class__.__name__
+        w['activation'] = self.name

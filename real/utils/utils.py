@@ -12,6 +12,7 @@ import theano
 import theano.tensor as T
 import numpy as np
 import Queue
+import re
 
 floatX = theano.config.floatX
 if floatX == 'float64':
@@ -240,6 +241,42 @@ def load_huffman_tree(prob_table):
 def save_tree(fn, idx2cls, idx2bitstr, mask):
     with file(fn, 'wb') as f:
         pickle.dump({'idx2cls': idx2cls, 'idx2bitstr': idx2bitstr, 'mask': mask}, f)
+
+
+_VAL_LINE = re.compile(r'INFO:.*:Val val_loss: (\d*\.\d*) - val_ppl: (\d*\.\d)')
+_TRAIN_LINE = re.compile(r'INFO:NCELangModelV4:Train - time: (\d*\.\d*) - loss: (\d*\.\d*)')
+
+
+def convert_logs(log, val_line=_VAL_LINE, trn_line=_TRAIN_LINE):
+    f = file(log, 'r')
+    val_loss = []
+    val_ppl = []
+    t_trn = []
+    trn_loss = []
+
+    for line in f:
+        val_mat = val_line.match(line)
+        if val_mat is not None:
+            loss = float(val_mat.group(1))
+            ppl = float(val_mat.group(2))
+            val_loss.append(loss)
+            val_ppl.append(ppl)
+            continue
+        trn_mat = trn_line.match(line)
+        if trn_mat is not None:
+            t = float(trn_mat.group(1))
+            loss = float(trn_mat.group(2))
+            t_trn.append(t)
+            trn_loss.append(loss)
+    f.close()
+
+    t_trn = np.array(t_trn)
+    t_trn -= t_trn[0]
+    trn_loss = np.array(trn_loss)
+    val_loss = np.array(val_loss[:-1])
+    val_ppl = np.array(val_ppl[:-1])
+
+    return t_trn, trn_loss, val_loss, val_ppl
 
 
 class TableSampler(rv_discrete):

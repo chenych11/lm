@@ -3,9 +3,9 @@
 __author__ = 'Yunchuan Chen'
 
 from utils import get_unigram_probtable
+from models import NCELangModelV2
+from keras.optimizers import AdamAnneal, adam
 import optparse
-from keras.optimizers import adam, AdamAnneal
-from models import NCELangModel
 
 DATA_PATH = '../data/corpus/wiki-sg-norm-lc-drop-bin.bz2'
 NB_RUN_WORDS = 100000000
@@ -54,7 +54,6 @@ nb_evaluate = options.nb_evaluation
 unigram_table = get_unigram_probtable(nb_words=nb_vocab,
                                       save_path='../data/wiki-unigram-prob-size%d.pkl' %
                                                 nb_vocab)
-
 if options.decay:
     opt = AdamAnneal(lr=options.lr, lr_min=options.lr_min, gamma=options.gamma)
 else:
@@ -70,12 +69,13 @@ if options.save == '':
 else:
     save_path = options.save
 
-model = NCELangModel(vocab_size=nb_vocab, nb_negative=options.negative, 
-                     embed_dims=options.embed_size, context_dims=options.context_size,
-                     negprob_table=unigram_table, optimizer=opt)
+model = NCELangModelV2(vocab_size=nb_vocab, nb_negative=options.negative,
+                       embed_dims=options.embed_size, context_dims=options.context_size,
+                       negprob_table=unigram_table, optimizer=opt)
 model.compile()
 model.train(data_file=DATA_PATH,
             save_path=save_path,
             batch_size=BATCH_SIZE, train_nb_words=nb_run_words,
             val_nb_words=nb_evaluate, train_val_nb=nb_run_val,
             validation_interval=options.interval, log_file=log_file)
+
