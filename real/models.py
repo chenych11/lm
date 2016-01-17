@@ -15,9 +15,10 @@ from keras.layers import containers
 # from keras.layers.embeddings import LookupTable
 import numpy as np
 import logging
+from keras.layers.core import Reshape
 from layers import LangLSTMLayer, PartialSoftmax, Split, LookupProb, PartialSoftmaxV1, \
     TreeLogSoftmax, SparseEmbedding, Identity, PartialSoftmaxV4, SharedWeightsDense, \
-    LangLSTMLayerV5, LangLSTMLayerV6, SparseEmbeddingV6
+    LangLSTMLayerV5, LangLSTMLayerV6, SparseEmbeddingV6, EmbeddingParam, LBLScoreV1
 from utils import LangHistory, LangModelLogger, categorical_crossentropy, objective_fnc, \
     TableSampler, slice_X, chunk_sentences
 # noinspection PyUnresolvedReferences
@@ -76,7 +77,7 @@ class LangModel(object):
             nb_words = mask.sum()
             probs = T.reshape(probs_, mask.shape)[mask.nonzero()] + 1.0e-37
 
-        return T.sum(T.log(1.0/probs)), nb_words
+        return -T.sum(T.log(probs)), nb_words
 
     @staticmethod
     def _get_shared_param(param):
@@ -2221,6 +2222,7 @@ class NCELangModelV6(Graph, LangModel):
         outs = f.summarize_outputs(outs, batch_info)
         return outs
 
+
 class TreeLangModel(Graph, LangModel):
     def __init__(self, vocab_size, embed_dim, cntx_dim, word2class, word2bitstr, optimizer='adam'):
         super(TreeLangModel, self).__init__()
@@ -2453,6 +2455,202 @@ class TreeLangModel(Graph, LangModel):
                 break
 
         log_file.close()
+
+
+class LBLangModelV1(Graph, LangModel):
+    def __init__(self, vocab_size, context_size, embed_dims=128, optimizer='adam'):
+        super(LBLangModelV1, self).__init__()
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dims
+        self.loss = categorical_crossentropy
+        self.loss_fnc = objective_fnc(self.loss)
+        self.optimizer = optimizers.get(optimizer)
+        self.context_size = context_size
+        self.weights = None
+        # self.max_sent_len = max_sent_len
+
+        self.add_input(name='ngrams', ndim=2, dtype='int32')
+
+        self.add_node(Embedding(vocab_size+context_size, embed_dims), name='embedding', inputs='ngrams')
+        self.add_node(EmbeddingParam(), name='embedding_param', inputs='embedding')
+        self.add_node(Reshape(-1), name='reshape', inputs='embedding')
+        composer_node = Dense(context_size*embed_dims, embed_dims)
+        composer_node.params = [composer_node.W]   # drop the bias parameters
+        # del composer_node.b
+        # replace the default behavior of Dense
+        composer_node.get_output = lambda train: node_get_output(composer_node, train)
+        self.add_node(composer_node, name='context_vec', inputs='reshape')
+        self.add_node(LBLScoreV1(vocab_size), name='score', inputs=('context_vec', 'embedding_param'))
+
+        self.add_output('prob', 'score')
+
+        def node_get_output(layer, train=False):
+            X = layer.get_input(train)
+            output = layer.activation(T.dot(X, layer.W))
+            return output
+
+    @staticmethod
+    def encode_length(y_label, y_pred, mask=None):
+        """
+        :param y_label: true index labels with shape (ns, )
+        :param y_pred: predicted probabilities with shape (ns, V)
+        :param mask: mask
+        :return: PPL
+        """
+        epsilon = 1e-7
+        y_pred = T.clip(y_pred, epsilon, 1.0 - epsilon)
+        # scale preds so that the class probas of each sample sum to 1
+        y_pred /= y_pred.sum(axis=-1, keepdims=True)
+
+        nb_samples = y_label.shape[0]
+        idx = T.reshape(T.arange(nb_samples), (nb_samples, 1))
+        probs_ = y_pred[idx, y_label]
+
+        return -T.sum(T.log(probs_)), nb_samples
+
+    # noinspection PyMethodOverriding
+    def compile(self, optimizer=None):
+        if optimizer is not None:
+            logger.info('compiling with %s' % optimizer)
+            self.optimizer = optimizers.get(optimizer)
+        # input of model
+        self.X_train = self.get_input(train=True)   # (n, m)   # assuming (m+1)-gram
+        self.X_test = self.get_input(train=False)   # (n, m)
+
+        self.y_train = self.get_output(train=True)  # (n, V)
+        self.y_test = self.get_output(train=False)  # (n, V)
+
+        # todo: mask support
+        mask = None
+        self.y = T.vector('y', dtype='int32')
+        train_loss = self.loss_fnc(self.y, self.y_train)
+        test_loss = self.loss_fnc(self.y, self.y_test)
+
+        train_loss.name = 'train_loss'
+        test_loss.name = 'test_loss'
+
+        # train_accuracy = T.mean(T.eq(T.argmax(self.y, axis=-1), T.argmax(self.y_train, axis=-1)),
+        #                         dtype=theano.config.floatX)
+        # test_accuracy = T.mean(T.eq(T.argmax(self.y, axis=-1), T.argmax(self.y_test, axis=-1)),
+        #                        dtype=theano.config.floatX)
+
+        train_ce, nb_trn_wrd = self.encode_length(self.y, self.y_train, mask)
+        test_ce, nb_tst_wrd = self.encode_length(self.y, self.y_test, mask)
+
+        for r in self.regularizers:
+            train_loss = r(train_loss)
+        updates = self.optimizer.get_updates(self.params, self.constraints, train_loss)
+        updates += self.updates
+
+        train_ins = [self.X_train, self.y]
+        test_ins = [self.X_test, self.y]
+        # predict_ins = [self.X_test]
+
+        self._train = theano.function(train_ins, [train_loss, train_ce, nb_trn_wrd], updates=updates,
+                                      allow_input_downcast=True)
+        self._train.out_labels = ['loss', 'encode_len', 'nb_words']
+        # self._predict = theano.function(predict_ins, self.y_test, allow_input_downcast=True)
+        # self._predict.out_labels = ['predicted']
+        self._test = theano.function(test_ins, [test_loss, test_ce, nb_tst_wrd], allow_input_downcast=True)
+        self._test.out_labels = ['loss', 'encode_len', 'nb_words']
+
+        # self._train_with_acc = theano.function(train_ins, [train_loss, train_accuracy, train_ce, nb_trn_wrd],
+        #                                        updates=updates,
+        #                                        allow_input_downcast=True, mode=theano_mode)
+        # self._test_with_acc = theano.function(test_ins, [test_loss, test_accuracy],
+        #                                       allow_input_downcast=True, mode=theano_mode)
+
+        # self.__compile_fncs(train_ins, train_loss, test_ins, test_loss, predict_ins, updates)
+
+        self.all_metrics = ['loss', 'ppl', 'val_loss', 'val_ppl']
+
+        # self._train.label2idx = dict((l, idx) for idx, l in enumerate(['loss', 'encode_len', 'nb_words']))
+        # self._test.label2idx = dict((l, idx) for idx, l in enumerate(['loss', 'encode_len', 'nb_words']))
+        #
+        # def __get_metrics_values(f, outs, metrics, prefix=''):
+        #     ret = []
+        #     label2idx = f.label2idx
+        #     for mtrx in metrics:
+        #         if mtrx == 'loss':
+        #             idx = label2idx[mtrx]
+        #             ret.append((prefix+mtrx, outs[idx]))
+        #         elif mtrx == 'ppl':
+        #             nb_words = outs[label2idx['nb_words']]
+        #             encode_len = outs[label2idx['encode_len']]
+        #             ret.append((prefix+'ppl', math.exp(float(encode_len)/float(nb_words))))
+        #         else:
+        #             logger.warn('Specify UNKNOWN metrics ignored')
+        #     return ret
+
+        def __summary_outputs(outs, batch_sizes):
+            out = np.array(outs, dtype=theano.config.floatX)
+            loss, encode_len, nb_words = out
+            batch_size = np.array(batch_sizes, dtype=theano.config.floatX)
+
+            smry_loss = np.sum(loss * batch_size)/batch_size.sum()
+            smry_encode_len = encode_len.sum()
+            smry_nb_words = nb_words.sum()
+            return [smry_loss, smry_encode_len, smry_nb_words]
+
+        # # self._train_with_acc.get_metrics_values = lambda outs, metrics, prefix='': \
+        # #     __get_metrics_values(self._train_with_acc, outs, metrics, prefix)
+        # self._train.get_metrics_values = lambda outs, metrics, prefix='': \
+        #     __get_metrics_values(self._train, outs, metrics, prefix)
+        # self._test.get_metrics_values = lambda outs, metrics, prefix='': \
+        #     __get_metrics_values(self._test, outs, metrics, prefix)
+        # # self._test_with_acc.get_metrics_values = lambda outs, metrics, prefix='': \
+        # #     __get_metrics_values(self._test_with_acc, outs, metrics, prefix)
+
+        # self._train_with_acc.summary_outputs = __summarize_outputs
+        self._train.summarize_outputs = __summary_outputs
+        self._test.summarize_outputs = __summary_outputs
+        # self._test_with_acc.summary_outputs = __summary_outputs
+
+        self.fit = self._fit_unweighted
+
+    def train(self, X, y, callbacks, show_metrics, batch_size=128, extra_callbacks=(LangModelLogger(), ),
+              validation_split=0., validation_data=None, shuffle=False, verbose=1):
+        data = {'ngrams': X, 'prob': y}
+        self.fit(data, callbacks, show_metrics, batch_size=batch_size, nb_epoch=1, verbose=verbose,
+                 extra_callbacks=extra_callbacks, validation_split=validation_split,
+                 validation_data=validation_data, shuffle=shuffle)
+
+    def train_from_dir(self, dir_, data_regex=re.compile(r'\d{3}.bz2'), callbacks=LangHistory(),
+                       show_metrics=('loss', 'ppl'), *args, **kwargs):
+        train_files_ = [os.path.join(dir_, f) for f in os.listdir(dir_) if data_regex.match(f)]
+        train_files = [f for f in train_files_ if os.path.isfile(f)]
+
+        for f in train_files:
+            logger.info('Loading training data from %s' % f)
+            X = np.loadtxt(f, dtype='int32')
+            # y = np.zeros((X.shape[0], X.shape[1], self.vocab_size), dtype=np.int8)
+            pad_idx = np.arange(self.vocab_size, self.vocab_size+self.context_size).reshape((1, -1))
+            pad_idx = pad_idx.repeat(X.shape[0], axis=0)
+            idxes = np.hstack((pad_idx, X))
+
+            ns = X.shape[0]
+            nt = X.shape[1]
+            nb_ele = X.size
+            X = np.empty(shape=(nb_ele, self.context_size), dtype='int32')
+            y_label = np.empty(shape=(nb_ele, ), dtype='int32')
+            start_end = np.array([0, 0], dtype='int32')
+            k = 0
+            for i in range(ns):
+                start_end[0], start_end[1] = 0, self.context_size
+                for j in range(nt):
+                    X[k] = idxes[i, start_end[0]:start_end[1]]
+                    y_label[k] = idxes[i, start_end[1]]
+                    k += 1
+                    start_end += 1
+
+            tmp = np.eye(self.vocab_size, dtype='int8')
+            y = tmp[y_label]
+            # for i in range(X.shape[0]):
+            #     for j in range(X.shape[1]):
+            #         idx = X[i, j]
+            #         y[i, j, idx] = 1
+            logger.info('Training on %s' % f)
+            self.train(X, y, callbacks, show_metrics, *args, **kwargs)
 
 
 if __name__ == '__main__':

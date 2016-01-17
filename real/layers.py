@@ -1008,3 +1008,116 @@ class ActivationLayer(Layer):
         w = super(ActivationLayer, self).get_config()
         w['name'] = self.__class__.__name__
         w['activation'] = self.name
+
+
+class EmbeddingParam(Layer):
+    def __init__(self):
+        super(EmbeddingParam, self).__init__()
+
+    def get_output(self, train=False):
+        return self.previous.params[0]
+
+    def get_input(self, train=False):
+        return self.previous.params[0]
+
+
+class LBLayer(Layer):
+    def __init__(self, context_size, embed_dim, init='glorot_uniform', weights=None, name=None,
+                 W_regularizer=None, activity_regularizer=None, W_constraint=None):
+        super(LBLayer, self).__init__()
+        self.context_size = context_size
+        self.embed_dim = embed_dim
+        self.init = initializations.get(init)
+        # self.tidx = theano.shared(np.arange(max_sent_len).reshape((max_sent_len, 1)).astype('int16') +
+        #                           np.arange(context_size).reshape((1, context_size)).astype('int16'), borrow=True)
+
+        W = np.empty(shape=(context_size, embed_dim, embed_dim), dtype=float_t)
+        for i in range(context_size):
+            W[i] = self.init((embed_dim, embed_dim), 'cpu').get_value(borrow=True)
+        self.W = theano.shared(W, name='cntx_w', borrow=True)
+        self.pad = theano.shared(np.zeros((1, self.context_size, self.context_size, self.embed_dim), dtype=float_t),
+                                 borrow=True)
+
+        self.params = [self.W, self.pad]
+        if weights is not None:
+            self.set_weights(weights)
+
+        if name is not None:
+            self.set_name(name)
+
+        self.regularizers = []
+        self.W_regularizer = regularizers.get(W_regularizer)
+        if self.W_regularizer:
+            self.W_regularizer.set_param(self.W)
+            self.regularizers.append(self.W_regularizer)
+
+        self.activity_regularizer = regularizers.get(activity_regularizer)
+        if self.activity_regularizer:
+            self.activity_regularizer.set_layer(self)
+            self.regularizers.append(self.activity_regularizer)
+
+        self.W_constraint = constraints.get(W_constraint)
+        self.constraints = [self.W_constraint]
+
+    def get_output(self, train=False):
+        ins = self.get_input(train=train)
+        ns = ins.shape[0]
+        nt = ins.shape[1]
+
+        y = T.dot(ins, self.W)
+        x = T.repeat(self.pad, ns, axis=0)
+        z = T.concatenate([x, y], axis=1)
+
+        sidx = T.arange(ns, dtype='int32').dimshuffle(0, 'x', 'x')
+        tidx = T.arange(nt+1, dtype='int32').dimshuffle(0, 'x') + \
+               T.arange(self.context_size, dtype='int32').dimshuffle('x', 0)
+        tidx = tidx.dimshuffle('x', 0, 1)
+        cidx = T.arange(self.context_size-1, -1, -1, dtype='int32').dimshuffle('x', 'x', 0)
+
+        d = z[sidx, tidx, cidx]
+        c = T.sum(d, axis=2)
+        return c
+
+    def supports_masked_input(self):
+        return None
+
+
+class LBLScore(MultiInputLayer):
+    def __init__(self, vocab_size):
+        super(LBLScore, self).__init__(slot_names=('context', 'word'))
+        self.vocab_size = vocab_size
+        # self.b = T.zeros((vocab_size, 1), dtype=floatX)
+        self.b = theano.shared(np.zeros((vocab_size, 1), dtype=float_t), borrow=True)
+        self.params = [self.b]
+
+    def get_output(self, train=False):
+        ins = self.get_input(train)
+        cntxt_vec = ins['context']
+        wrd_vec = ins['word'].dimshuffle(0, 1, 'x')
+        prob_ = T.exp(T.dot(cntxt_vec, wrd_vec) + self.b)
+        prob_ = T.addbroadcast(prob_, 3)
+        prob_ = prob_.dimshuffle(0, 1, 2)
+        prob = prob_/T.sum(prob_, axis=-1, keepdims=True)
+
+        return prob
+
+
+class LBLScoreV1(MultiInputLayer):
+    def __init__(self, vocab_size):
+        super(LBLScoreV1, self).__init__(slot_names=('context', 'word'))
+        self.vocab_size = vocab_size
+        # self.b = T.zeros((vocab_size, 1), dtype=floatX)
+        self.b = theano.shared(np.zeros((vocab_size, 1), dtype=float_t), borrow=True)
+        self.params = [self.b]
+
+    def get_output(self, train=False):
+        ins = self.get_input(train)
+        cntxt_vec = ins['context']
+        wrd_vec = ins['word'].dimshuffle(0, 1, 'x')
+        prob_ = T.exp(T.dot(cntxt_vec, wrd_vec) + self.b)
+        prob_ = T.addbroadcast(prob_, 2)
+        prob_ = prob_.dimshuffle(0, 1)
+        prob = prob_/T.sum(prob_, axis=-1, keepdims=True)
+
+        return prob
+

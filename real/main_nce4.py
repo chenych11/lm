@@ -5,7 +5,7 @@ __author__ = 'Yunchuan Chen'
 from utils import get_unigram_probtable
 import optparse
 from keras.optimizers import adam, AdamAnneal
-from models import NCELangModelV4
+from models import NCELangModelV4, logger
 import cPickle as pickle
 import sys
 # noinspection PyUnresolvedReferences
@@ -76,7 +76,7 @@ if embedding_file != '':
     with file('../data/wiki-wordmap-trunc300k.wp', 'rb') as f:
         wp = pickle.load(f)
     freq = wp['idx2wc']
-    print >> sys.stderr, 'Using word2vec to initialize word embeddings %s ' % embedding_file
+    logger.info('Using word2vec to initialize word embeddings %s ' % embedding_file)
     ini_embeds = [compose_dense_repr(nb_base, nb_vocab, freq, embedding_file)]
 else:
     ini_embeds = None

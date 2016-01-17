@@ -21,7 +21,7 @@ else:
     epsilon = 1.0e-7
 
 
-def categorical_crossentropy(y_true, y_pred):
+def categorical_crossentropy2d(y_true, y_pred):
     """
     :param y_true: true index labels with shape (ns, nt)
     :param y_pred: predicted probabilities with shape (ns, nt, V)
@@ -37,6 +37,31 @@ def categorical_crossentropy(y_true, y_pred):
     time_idx = T.reshape(T.arange(nt), (1, nt))
     probs_ = y_pred[sample_idx, time_idx, y_true]
     return -T.log(probs_)
+
+
+def categorical_crossentropy1d(y_true, y_pred):
+    """
+    :param y_true: true index labels with shape (n, )
+    :param y_pred: predicted probabilities with shape (n, V)
+    :return: cce
+    """
+    y_pred = T.clip(y_pred, epsilon, 1.0 - epsilon)
+    # scale preds so that the class probas of each sample sum to 1
+    y_pred /= y_pred.sum(axis=-1, keepdims=True)
+
+    n = y_true.shape[0]
+    sample_idx = T.reshape(T.arange(n), (n, 1))
+    probs_ = y_pred[sample_idx, y_true]
+    return -T.log(probs_)
+
+
+def categorical_crossentropy(y_true, y_pred):
+    if y_true.ndim == 1:
+        return categorical_crossentropy1d(y_true, y_pred)
+    elif y_true.ndim == 2:
+        return categorical_crossentropy2d(y_true, y_pred)
+    else:
+        raise NotImplementedError('not implemented for 3D or larger dimensions')
 
 
 def objective_fnc(fn):
@@ -97,7 +122,7 @@ def slice_X(X, start_, end_=None, axis=1):
         return ret
 
 
-def get_unigram_probtable(nb_words, wordmap='../data/wiki-wordmap.wp',
+def get_unigram_probtable(nb_words, wordmap='../data/wiki-wordmap-trunc300k.wp',
                           save_path='../data/wiki-unigram-prob-size10000.pkl'):
     if os.path.exists(save_path):
         with file(save_path, 'rb') as f:
