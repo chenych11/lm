@@ -16,6 +16,7 @@ from keras.layers import containers
 import numpy as np
 import logging
 from keras.layers.core import Reshape
+# from keras.regularizers import l2
 from layers import LangLSTMLayer, PartialSoftmax, Split, LookupProb, PartialSoftmaxV1, \
     TreeLogSoftmax, SparseEmbedding, Identity, PartialSoftmaxV4, SharedWeightsDense, \
     LangLSTMLayerV5, LangLSTMLayerV6, SparseEmbeddingV6, EmbeddingParam, LBLScoreV1
@@ -2458,12 +2459,13 @@ class TreeLangModel(Graph, LangModel):
 
 
 class LBLangModelV1(Graph, LangModel):
+    # the standard LBL language model
     def __init__(self, vocab_size, context_size, embed_dims=128, optimizer='adam'):
         super(LBLangModelV1, self).__init__()
         self.vocab_size = vocab_size
         self.embed_dim = embed_dims
-        self.loss = categorical_crossentropy
-        self.loss_fnc = objective_fnc(self.loss)
+        # self.loss = categorical_crossentropy
+        # self.loss_fnc = objective_fnc(self.loss)
         self.optimizer = optimizers.get(optimizer)
         self.context_size = context_size
         self.weights = None
@@ -2471,23 +2473,32 @@ class LBLangModelV1(Graph, LangModel):
 
         self.add_input(name='ngrams', ndim=2, dtype='int32')
 
+        # self.add_node(Embedding(vocab_size+context_size, embed_dims, W_regularizer=l2(0.0005/vocab_size)),
+        #               name='embedding', inputs='ngrams')
         self.add_node(Embedding(vocab_size+context_size, embed_dims), name='embedding', inputs='ngrams')
         self.add_node(EmbeddingParam(), name='embedding_param', inputs='embedding')
         self.add_node(Reshape(-1), name='reshape', inputs='embedding')
         composer_node = Dense(context_size*embed_dims, embed_dims)
         composer_node.params = [composer_node.W]   # drop the bias parameters
+        # composer_node.W_regularizer = l2(0.0001)
+        # composer_node.W_regularizer.set_param(composer_node.W)
+        # composer_node.regularizers = [composer_node.W_regularizer]
         # del composer_node.b
         # replace the default behavior of Dense
         composer_node.get_output = lambda train: node_get_output(composer_node, train)
         self.add_node(composer_node, name='context_vec', inputs='reshape')
         self.add_node(LBLScoreV1(vocab_size), name='score', inputs=('context_vec', 'embedding_param'))
+        # self.add_node(LBLScoreV1(vocab_size, b_regularizer=l2(0.0001)),
+        #               name='score', inputs=('context_vec', 'embedding_param'))
 
         self.add_output('prob', 'score')
 
         def node_get_output(layer, train=False):
             X = layer.get_input(train)
-            output = layer.activation(T.dot(X, layer.W))
+            output = T.dot(X, layer.W)  # there is no activation.
             return output
+
+        self.fit = None
 
     @staticmethod
     def encode_length(y_label, y_pred, mask=None):
@@ -2497,19 +2508,21 @@ class LBLangModelV1(Graph, LangModel):
         :param mask: mask
         :return: PPL
         """
-        epsilon = 1e-7
-        y_pred = T.clip(y_pred, epsilon, 1.0 - epsilon)
-        # scale preds so that the class probas of each sample sum to 1
-        y_pred /= y_pred.sum(axis=-1, keepdims=True)
+        ## there is no need to clip here, for the prob. have already clipped by LBLayer
+        # epsilon = 1e-7
+        # y_pred = T.clip(y_pred, epsilon, 1.0 - epsilon)
+        # # scale preds so that the class probas of each sample sum to 1
+        # y_pred /= y_pred.sum(axis=-1, keepdims=True)
 
         nb_samples = y_label.shape[0]
-        idx = T.reshape(T.arange(nb_samples), (nb_samples, 1))
+        idx = T.arange(nb_samples)
         probs_ = y_pred[idx, y_label]
 
         return -T.sum(T.log(probs_)), nb_samples
 
     # noinspection PyMethodOverriding
     def compile(self, optimizer=None):
+        # from theano.compile.nanguardmode import NanGuardMode
         if optimizer is not None:
             logger.info('compiling with %s' % optimizer)
             self.optimizer = optimizers.get(optimizer)
@@ -2520,22 +2533,21 @@ class LBLangModelV1(Graph, LangModel):
         self.y_train = self.get_output(train=True)  # (n, V)
         self.y_test = self.get_output(train=False)  # (n, V)
 
+        # self.y_train, cntx_nrm = self.get_output(train=True)  # (n, V)
+        # self.y_test, _ = self.get_output(train=False)  # (n, V)
+        # nrm = self.nodes['embedding_param'].get_max_norm()
+
         # todo: mask support
         mask = None
         self.y = T.vector('y', dtype='int32')
-        train_loss = self.loss_fnc(self.y, self.y_train)
-        test_loss = self.loss_fnc(self.y, self.y_test)
-
-        train_loss.name = 'train_loss'
-        test_loss.name = 'test_loss'
-
-        # train_accuracy = T.mean(T.eq(T.argmax(self.y, axis=-1), T.argmax(self.y_train, axis=-1)),
-        #                         dtype=theano.config.floatX)
-        # test_accuracy = T.mean(T.eq(T.argmax(self.y, axis=-1), T.argmax(self.y_test, axis=-1)),
-        #                        dtype=theano.config.floatX)
 
         train_ce, nb_trn_wrd = self.encode_length(self.y, self.y_train, mask)
         test_ce, nb_tst_wrd = self.encode_length(self.y, self.y_test, mask)
+
+        train_loss = train_ce / nb_trn_wrd.astype(floatX)
+        test_loss = test_ce / nb_tst_wrd.astype(floatX)
+        train_loss.name = 'train_loss'
+        test_loss.name = 'test_loss'
 
         for r in self.regularizers:
             train_loss = r(train_loss)
@@ -2545,6 +2557,11 @@ class LBLangModelV1(Graph, LangModel):
         train_ins = [self.X_train, self.y]
         test_ins = [self.X_test, self.y]
         # predict_ins = [self.X_test]
+
+        # self._train = theano.function(train_ins, [train_loss, train_ce, nb_trn_wrd, nrm, cntx_nrm], updates=updates,
+        #                               allow_input_downcast=True,
+        #                               mode=NanGuardMode(nan_is_error=True, inf_is_error=True, big_is_error=True))
+        # self._train.out_labels = ['loss', 'encode_len', 'nb_words', 'max_norm', 'max_cntxt_nrm']
 
         self._train = theano.function(train_ins, [train_loss, train_ce, nb_trn_wrd], updates=updates,
                                       allow_input_downcast=True)
@@ -2608,58 +2625,180 @@ class LBLangModelV1(Graph, LangModel):
 
         self.fit = self._fit_unweighted
 
-    def train(self, X, y, callbacks, show_metrics, batch_size=128, extra_callbacks=(LangModelLogger(), ),
-              validation_split=0., validation_data=None, shuffle=False, verbose=1):
-        data = {'ngrams': X, 'prob': y}
-        self.fit(data, callbacks, show_metrics, batch_size=batch_size, nb_epoch=1, verbose=verbose,
-                 extra_callbacks=extra_callbacks, validation_split=validation_split,
-                 validation_data=validation_data, shuffle=shuffle)
+    def _loop_train(self, data, batch_size):
+        nb_words = data[0].shape[0]
+        # loss, nrm, cnrm = 0.0, 0.0, 0.0
+        loss = 0.0
+        enc_len = 0.0
+        batches = make_batches(nb_words, batch_size)
+        for start, end in batches:
+            ins_batch = slice_X(data, start_=start, end_=end, axis=0)
+            loss_, enc_len_, _ = self._train(*ins_batch)
+            loss += loss_ * ins_batch[1].size
+            enc_len += enc_len_
 
-    def train_from_dir(self, dir_, data_regex=re.compile(r'\d{3}.bz2'), callbacks=LangHistory(),
-                       show_metrics=('loss', 'ppl'), *args, **kwargs):
-        train_files_ = [os.path.join(dir_, f) for f in os.listdir(dir_) if data_regex.match(f)]
-        train_files = [f for f in train_files_ if os.path.isfile(f)]
+        loss /= nb_words
+        ppl = math.exp(enc_len/nb_words)
+        # return loss, nrm, cnrm
+        return loss, ppl
 
-        for f in train_files:
-            logger.info('Loading training data from %s' % f)
-            X = np.loadtxt(f, dtype='int32')
-            # y = np.zeros((X.shape[0], X.shape[1], self.vocab_size), dtype=np.int8)
-            pad_idx = np.arange(self.vocab_size, self.vocab_size+self.context_size).reshape((1, -1))
-            pad_idx = pad_idx.repeat(X.shape[0], axis=0)
-            idxes = np.hstack((pad_idx, X))
+    def prepare_input(self, sents):
+        ns = sents.shape[0]
+        nt = sents.shape[1]
+        nb_ele = sents.size  # NO. of words in the sentences.
 
-            ns = X.shape[0]
-            nt = X.shape[1]
-            nb_ele = X.size
-            X = np.empty(shape=(nb_ele, self.context_size), dtype='int32')
-            y_label = np.empty(shape=(nb_ele, ), dtype='int32')
-            start_end = np.array([0, 0], dtype='int32')
-            k = 0
-            for i in range(ns):
-                start_end[0], start_end[1] = 0, self.context_size
-                for j in range(nt):
-                    X[k] = idxes[i, start_end[0]:start_end[1]]
-                    y_label[k] = idxes[i, start_end[1]]
-                    k += 1
-                    start_end += 1
+        pad_idx = np.arange(self.vocab_size, self.vocab_size+self.context_size).reshape((1, -1))
+        pad_idx = pad_idx.repeat(ns, axis=0)  # (ns, c), where c is context size
+        idxes = np.hstack((pad_idx, sents))   # (ns, c+s), where s is sentence length
 
-            tmp = np.eye(self.vocab_size, dtype='int8')
-            y = tmp[y_label]
-            # for i in range(X.shape[0]):
-            #     for j in range(X.shape[1]):
-            #         idx = X[i, j]
-            #         y[i, j, idx] = 1
-            logger.info('Training on %s' % f)
-            self.train(X, y, callbacks, show_metrics, *args, **kwargs)
+        X = np.empty(shape=(nb_ele, self.context_size), dtype='int32')
+        y_label = np.empty(shape=(nb_ele, ), dtype='int32')
+        start_end = np.array([0, 0], dtype='int32')
+        k = 0
+        for i in range(ns):  # loop on sentences
+            start_end[0], start_end[1] = 0, self.context_size
+            for _ in range(nt):  # loop on time (each time step corresponds to a word)
+                X[k] = idxes[i, start_end[0]:start_end[1]]
+                y_label[k] = idxes[i, start_end[1]]
+                k += 1
+                start_end += 1
+        return X, y_label
+
+    def train(self, data_file='../data/corpus/wiki-sg-norm-lc-drop-bin-sample.bz2', save_path=None,
+              batch_size=256, train_nb_words=100000000, val_nb_words=100000, train_val_nb=100000,
+              validation_interval=1800, log_file=None):
+        opt_info = self.optimizer.get_config()
+        opt_info = ', '.join(["{}: {}".format(n, v) for n, v in opt_info.items()])
+
+        logger.info('training with file: %s' % data_file)
+        logger.info('training with batch size %d' % batch_size)
+        logger.info('training with %d words; validate with %d words during training; '
+                    'evaluate with %d words after training' % (train_nb_words, train_val_nb, val_nb_words))
+        logger.info('validate every %f seconds' % float(validation_interval))
+        logger.info('optimizer: %s' % opt_info)
+
+        log_file = LogInfo(log_file)
+        log_file.info('training with file: %s' % data_file)
+        log_file.info('training with batch size %d' % batch_size)
+        log_file.info('training with %d words; validate with %d words during training; '
+                      'evaluate with %d words after training' % (train_nb_words, train_val_nb, val_nb_words))
+        log_file.info('validate every %f seconds' % float(validation_interval))
+        log_file.info('optimizer: %s' % opt_info)
+
+        sentences = [None for _ in range(MAX_SETN_LEN)]  # TODO: sentences longer than 64 are ignored.
+
+        max_vocab = self.vocab_size - 1
+        nb_trained = 0.
+        nb_words_trained = 0.0
+        sent_gen = grouped_sentences(data_file)
+        val_sents = self.get_val_data(sent_gen, val_nb_words)
+        train_val_sents = self.get_val_data(sent_gen, train_val_nb)
+
+        self.validation(train_val_sents, batch_size, log_file)
+        start_ = time()
+        next_val_time = start_ + validation_interval
+        for sents in sent_gen:
+            mask = (sents > max_vocab)
+            sents[mask] = max_vocab
+            chunk = chunk_sentences(sentences, sents, batch_size)
+            if chunk is None:
+                continue
+
+            x = self.prepare_input(chunk)
+            # loss, nrm, cnrm = self._loop_train(x, batch_size)
+            loss, ppl = self._loop_train(x, batch_size)
+            nb_trained += chunk.shape[0]
+            nb_words_trained += chunk.size
+            end_ = time()
+            elapsed = float(end_ - start_)
+            speed1 = nb_trained/elapsed
+            speed2 = nb_words_trained/elapsed
+            eta = (train_nb_words - nb_words_trained) / speed2
+            eta_h = int(math.floor(eta/3600))
+            eta_m = int(math.ceil((eta - eta_h * 3600)/60.))
+            logger.info('%s:Train - ETA: %02d:%02d - loss: %5.3f - ppl: %6.2f speed: %.1f sent/s %.1f words/s' %
+                        (self.__class__.__name__, eta_h, eta_m, loss, ppl, speed1, speed2))
+            log_file.info('%s:Train - time: %f - loss: %.6f' % (self.__class__.__name__, end_, loss))
+
+            if end_ > next_val_time:
+                # noinspection PyUnresolvedReferences
+                self.validation(train_val_sents, batch_size, log_file)
+                next_val_time = time() + validation_interval
+
+            if nb_words_trained >= train_nb_words:
+                logger.info('Training finished. Evaluating ...')
+                log_file.info('Training finished. Evaluating ...')
+                self.validation(val_sents, batch_size, log_file)
+                if save_path is not None:
+                    self.save_params(save_path)
+                break
+        log_file.close()
+
+    def validation(self, val_sents, batch_size, log_file=None):
+        """
+        :param val_sents: validation sentences.
+        :type val_sents: a list, each element a ndarray
+        :return: tuple
+        """
+        code_len = 0.
+        nb_words = 0.
+        loss = 0.0
+
+        for sents in val_sents:
+            x = self.prepare_input(sents)
+            loss_, code_len_, nb_words_ = self._test_loop(self._test, x, batch_size)
+            nb_words += nb_words_
+            code_len += code_len_
+            loss += loss_ * nb_words_
+
+        loss /= nb_words
+        # try:
+        ppl = math.exp(code_len/nb_words)
+        # except OverflowError:
+        #     logger.error("code_len: %.3f - nb_words: %d" % (code_len, nb_words))
+        #     ppl = self.vocab_size * 1000
+        logger.info('%s:Val val_loss: %.2f - val_ppl: %.2f' % (self.__class__.__name__, loss, ppl))
+        log_file.info('%s:Val val_loss: %.6f - val_ppl: %.6f' % (self.__class__.__name__, loss, ppl))
+
+        return loss, ppl
+
+    @staticmethod
+    def _test_loop(f, ins, batch_size=128, verbose=0):
+        nb_sample = ins[0].shape[0]
+        outs = [[] for _ in range(f.n_returned_outputs)]
+        batch_info = []
+        batches = make_batches(nb_sample, batch_size)
+        for batch_index, (batch_start, batch_end) in enumerate(batches):
+            ins_batch = slice_X(ins, start_=batch_start, end_=batch_end, axis=0)
+            batch_outs = f(*ins_batch)
+            for idx, v in enumerate(batch_outs):
+                outs[idx].append(v)
+            batch_info.append(batch_end - batch_start)
+
+        outs = f.summarize_outputs(outs, batch_info)
+        return outs
 
 
 if __name__ == '__main__':
-    data_path = '../data/corpus/wiki-sg-norm-lc-drop-bin.bz2'
-    model = SimpleLangModel(vocab_size=10000, embed_dims=128, context_dims=128, optimizer='adam')
-    model.compile()
+    from keras.optimizers import AdamAnneal
+    # data_path = '../data/corpus/wiki-sg-norm-lc-drop-bin.bz2'
+    # model = SimpleLangModel(vocab_size=10000, embed_dims=128, context_dims=128, optimizer='adam')
+    # model.compile()
+    # # model.train_from_dir(data_fn=data_path, validation_split=0., batch_size=256, verbose=1)
+    # model.train(data_file='../data/corpus/wiki-sg-norm-lc-drop-bin.bz2',
+    #             save_path='../data/models/lang/simple-e128-c128.pkl',
+    #             batch_size=256, train_nb_words=100000000,
+    #             val_nb_words=5000000, train_val_nb=100000)
+    #             #batch_size=256, train_nb_words=1000000, val_nb_words=10000, validation_interval=20)
+
+    data_path = '../data/corpus/wiki-sg-norm-lc-drop-bin-sample.bz2'
+    # vocab_size, context_size, embed_dims=128, optimizer='adam'
+    opt = AdamAnneal(lr=0.02, lr_min=0.001, gamma=0.03)
+    model = LBLangModelV1(vocab_size=20000, context_size=5, embed_dims=200)
+    model.compile(opt)
     # model.train_from_dir(data_fn=data_path, validation_split=0., batch_size=256, verbose=1)
-    model.train(data_file='../data/corpus/wiki-sg-norm-lc-drop-bin.bz2',
-                save_path='../data/models/lang/simple-e128-c128.pkl',
-                batch_size=256, train_nb_words=100000000,
-                val_nb_words=5000000, train_val_nb=100000)
-                #batch_size=256, train_nb_words=1000000, val_nb_words=10000, validation_interval=20)
+    model.train(data_file=data_path,
+                save_path='../data/models/lang/simple-lbl-e200-c200-lr0.01-lr_min0.001-gamma0.03-d-test.pkl',
+                batch_size=512, train_nb_words=100000000,
+                val_nb_words=5000000, train_val_nb=100000,
+                log_file='../logs/simple-lbl-e200-c200-lr0.01-lr_min0.001-gamma0.03-d-test.log')

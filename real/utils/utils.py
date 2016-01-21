@@ -15,10 +15,11 @@ import Queue
 import re
 
 floatX = theano.config.floatX
-if floatX == 'float64':
-    epsilon = 1.0e-9
-else:
-    epsilon = 1.0e-7
+epsilon = 1.0e-9
+# if floatX == 'float64':
+#     epsilon = 1.0e-9
+# else:
+#     epsilon = 1.0e-7
 
 
 def categorical_crossentropy2d(y_true, y_pred):
@@ -50,7 +51,7 @@ def categorical_crossentropy1d(y_true, y_pred):
     y_pred /= y_pred.sum(axis=-1, keepdims=True)
 
     n = y_true.shape[0]
-    sample_idx = T.reshape(T.arange(n), (n, 1))
+    sample_idx = T.arange(n)
     probs_ = y_pred[sample_idx, y_true]
     return -T.log(probs_)
 

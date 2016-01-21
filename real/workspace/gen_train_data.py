@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 __author__ = 'Yunchuan Chen'
 # noinspection PyUnresolvedReferences
-from lm.utils.preprocess import grouped_sentences
+from lm.utils.preprocess import grouped_sentences, smart_open
 import numpy as np
 
 DATA_PATH = '../../data/corpus/wiki-sg-norm-lc-drop-bin.bz2'
-DATA_DIST = '../../data/corpus/wiki-sg-norm-lc-drop-bin-sample.bz2'
+DATA_DIST = '../../data/corpus/wiki-sg-norm-lc-drop-bin-sample0.2B.bz2'
 
 
 def _commit_result(dist_file, sents):
@@ -16,10 +16,10 @@ def _commit_result(dist_file, sents):
 
 first_chunk_size = 50000000
 next_chunk_start = first_chunk_size * 2
-total_size = 100000000
+total_size = 200000000
 nb_words = 0
 
-dist_file = file(DATA_DIST, 'wb')
+dist_file = smart_open(DATA_DIST, 'wb')
 sents = grouped_sentences(DATA_PATH)
 for chunk in sents:
     if nb_words > first_chunk_size:
@@ -39,6 +39,5 @@ for chunk in sents:
     nb_words += chunk.size
     _commit_result(dist_file, chunk)
 
-
-
+dist_file.close()
 
