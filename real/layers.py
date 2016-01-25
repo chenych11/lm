@@ -802,10 +802,9 @@ class TreeLogSoftmax(Embedding, MultiInputLayer):
 
 class SparseEmbedding(MultiInputLayer):
     """
-        Turn positive integers (indexes) into denses vectors of fixed size.
-        eg. [[4], [20]] -> [[0.25, 0.1], [0.6, -0.2]]
+        Turn rows of sparse representations of words into dense vectors of fixed size
 
-        @input_dim: size of vocabulary (highest input integer + 1)
+        @input_dim: size of the sparse reprsentation
         @out_dim: size of dense representation
     """
     def __init__(self, input_dim, output_dim, init='uniform',
@@ -1052,4 +1051,40 @@ class LBLScoreV1(MultiInputLayer):
         prob /= T.sum(prob_, axis=-1, keepdims=True) + epsilon
         # cntx_norm = T.max(T.sqrt(T.sum(cntxt_vec * cntxt_vec, axis=1)))
         return prob  # cntx_norm
+
+
+class PartialSoftmaxLBL(MultiInputLayer):
+    """ this layer is designed specifically for LBL language model
+    """
+    def __init__(self, base_size, word_vecs, b_regularizer=None):
+        MultiInputLayer.__init__(self, slot_names=['idxes', 'sparse_codings', 'features'])
+        self.b = shared_zeros((base_size, 1), dtype=float_t)
+        self.params = [self.b]
+        self.W = word_vecs[:base_size]
+        self.regularizers = []
+        if b_regularizer is not None:
+            self.b_regularizer = regularizers.get(b_regularizer)
+            self.b_regularizer.set_param(self.b)
+            self.regularizers.append(self.b_regularizer)
+        self.__input_slots = None
+
+    def get_input(self, train=False):
+        if self.__input_slots is None:
+            self.__input_slots = {True: dict((name, layer.get_output(True)) for name, layer in
+                                             zip(self.input_layer_names, self.input_layers)),
+                                  False: dict((name, layer.get_output(False)) for name, layer in
+                                              zip(self.input_layer_names, self.input_layers))}
+        return self.__input_slots[train]
+
+    def get_output(self, train=False):
+        ins = self.get_input(train)
+        idxes = ins['idxes']                    # (k+1, ns)
+        sparse_codings = ins['sparse_codings']  # (M, B+1), where M = ns*(k+1)
+        features = ins['features']              # (ns, dc)
+        detectors_flat = tsp.structured_dot(sparse_codings, self.W)        # (M, dc)
+        bias_flat = tsp.structured_dot(sparse_codings, self.b)        # (M, 1)
+        bias = T.reshape(bias_flat, idxes.shape, ndim=idxes.ndim)     # (k+1, ns)
+        detec_shape = T.concatenate([idxes.shape, [-1]])              # = (k+1, ns, -1)
+        detectors = T.reshape(detectors_flat, detec_shape, ndim=idxes.ndim+1)   # (k+1, ns, dc)
+        return T.exp(T.sum(detectors * features, axis=-1) + bias)     # (k+1, ns)
 
