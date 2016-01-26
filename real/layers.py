@@ -1078,13 +1078,13 @@ class PartialSoftmaxLBL(MultiInputLayer):
 
     def get_output(self, train=False):
         ins = self.get_input(train)
-        idxes = ins['idxes']                    # (k+1, ns)
-        sparse_codings = ins['sparse_codings']  # (M, B+1), where M = ns*(k+1)
-        features = ins['features']              # (ns, dc)
-        detectors_flat = tsp.structured_dot(sparse_codings, self.W)        # (M, dc)
-        bias_flat = tsp.structured_dot(sparse_codings, self.b)        # (M, 1)
-        bias = T.reshape(bias_flat, idxes.shape, ndim=idxes.ndim)     # (k+1, ns)
-        detec_shape = T.concatenate([idxes.shape, [-1]])              # = (k+1, ns, -1)
+        idxes = ins['idxes']                                                    # (k+1, ns)
+        sparse_codings = ins['sparse_codings']                                  # (M, B+1), where M = ns*(k+1)
+        features = ins['features']                                              # (ns, dc)
+        detectors_flat = tsp.structured_dot(sparse_codings, self.W)             # (M, dc)
+        bias_flat = tsp.structured_dot(sparse_codings, self.b)                  # (M, 1)
+        bias = T.reshape(bias_flat, idxes.shape, ndim=idxes.ndim)               # (k+1, ns)
+        detec_shape = T.concatenate([idxes.shape, [-1]])                        # = (k+1, ns, -1)
         detectors = T.reshape(detectors_flat, detec_shape, ndim=idxes.ndim+1)   # (k+1, ns, dc)
-        return T.exp(T.sum(detectors * features, axis=-1) + bias)     # (k+1, ns)
+        return T.exp(T.sum(detectors * features, axis=-1) + bias)               # (k+1, ns)
 

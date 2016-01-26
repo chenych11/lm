@@ -2812,16 +2812,17 @@ class LBLangModelV2(Graph, LangModel):
 
         if negprob_table is None:
             negprob_table_ = np.ones(shape=(vocab_size,), dtype=theano.config.floatX)/vocab_size
-            negprob_table = theano.shared(negprob_table_)
+            # negprob_table = theano.shared(negprob_table_)
             self.neg_prob_table = negprob_table_
         else:
             self.neg_prob_table = negprob_table.astype(theano.config.floatX)
-            negprob_table = theano.shared(negprob_table.astype(theano.config.floatX))
+            # negprob_table = theano.shared(negprob_table.astype(theano.config.floatX))
 
         # self.sampler = TableSampler(self.neg_prob_table)
 
         self.add_input(name='ngrams', ndim=2, dtype='int32')          # (ns, c), where c is the context size
         self.add_input(name='label_with_neg', ndim=2, dtype='int32')  # (k+1, ns)
+        self.add_input(name='lookup_prob', ndim=2, dtype=floatX)      # (k+1, ns)
 
         cntx_codes = tsp.csr_matrix('cntx-codes', dtype=floatX)
         label_codes = tsp.csr_matrix('label_codes', dtype=floatX)
@@ -2846,7 +2847,7 @@ class LBLangModelV2(Graph, LangModel):
                                         word_vecs=self.nodes['embedding'].W),
                       name='part_prob', inputs=('label_with_neg', 'label_codes_flat', 'context_vec'))
 
-        self.add_node(LookupProb(negprob_table), name='lookup_prob', inputs='label_with_neg')
+        # self.add_node(LookupProb(negprob_table), name='lookup_prob', inputs='label_with_neg')
         self.add_node(SharedWeightsDense(self.nodes['part_prob'].W,
                                          self.nodes['part_prob'].b,
                                          self.sparse_coding, activation='softmax'),
@@ -2912,9 +2913,9 @@ class LBLangModelV2(Graph, LangModel):
         neg_prob_tst = neg_prob_layer.get_output(train=False) * self.nb_negative
         pre_prob_tst = pre_prob_layer.get_output(train=False)
 
-        # pos_prob_trn = T.clip(pos_prob_trn, epsilon, 1.0 - epsilon)
-        # pos_prob_tst = T.clip(pos_prob_tst, epsilon, 1.0 - epsilon)
-        # pre_prob_tst = T.clip(pre_prob_tst, epsilon, 1.0 - epsilon)
+        pos_prob_trn = T.clip(pos_prob_trn, epsilon, 1.0 - epsilon)
+        pos_prob_tst = T.clip(pos_prob_tst, epsilon, 1.0 - epsilon)
+        pre_prob_tst = T.clip(pre_prob_tst, epsilon, 1.0 - epsilon)
 
         # nrm_const = normlzer_layer.get_output(train=True)
         # nrm_const = T.reshape(nrm_const, (nrm_const.shape[0], nrm_const.shape[1]))
@@ -2941,6 +2942,7 @@ class LBLangModelV2(Graph, LangModel):
         input1 = self.inputs['label_with_neg'].get_output(True)
         input2 = self.nodes['cntx_codes_flat'].get_output(True)
         input3 = self.nodes['label_codes_flat'].get_output(True)
+        input4 = self.inputs['lookup_prob'].get_output(True)
 
         true_labels = input1[0]
         encode_len, nb_words = self.encode_length(true_labels, pre_prob_tst)
@@ -2955,8 +2957,8 @@ class LBLangModelV2(Graph, LangModel):
         updates = self.optimizer.get_updates(self.params, self.constraints, train_loss)
         updates += self.updates
 
-        train_ins = [input0, input1, input2, input3]
-        test_ins = [input0, input1, input2, input3]
+        train_ins = [input0, input1, input2, input3, input4]
+        test_ins = [input0, input1, input2, input3, input4]
 
         self._train = theano.function(train_ins, train_loss, updates=updates)
         self._train.out_labels = ['loss', 'encode_len', 'nb_words']
@@ -3376,11 +3378,13 @@ def prepare_input(sents_queue, jobs_pool, all_finished,
     sp_pad_inptr = np.frombuffer(sp_pad_inptr, dtype='int32')
     sparse_coding = sparse.csr_matrix((sp_data, sp_indices, sp_indptr), shape=sp_shape)
     sparse_coding_pad = sparse.csr_matrix((sp_pad_data, sp_pad_indices, sp_pad_inptr), shape=sp_pad_shape)
+    custm = stats.rv_discrete(name='custm', values=(xk, pk))
+
     while not all_finished.is_set() or not sents_queue.empty():
         sents = sents_queue.get()
         X, y_label = get_cntx_label(sents, vocab_size, context_size)
-        custm = stats.rv_discrete(name='custm', values=(xk, pk))
         y_label = negative_sampleLBLV2(y_label, custm, nb_negative)
+        probs = pk[y_label]
 
         nb_sample = X.shape[0]
         batches = make_batches(nb_sample, batch_size)
@@ -3392,8 +3396,9 @@ def prepare_input(sents_queue, jobs_pool, all_finished,
             y_ = y_label[:, batch_start:batch_end]
             sp_x_ = sparse_coding_pad[X_.ravel()]
             sp_y_ = sparse_coding[y_.ravel()]
+            probs_ = probs[:, batch_start:batch_end]
 
-            jobs_pool.put((X_, y_, sp_x_, sp_y_))
+            jobs_pool.put((X_, y_, sp_x_, sp_y_, probs_))
 
 if __name__ == '__main__':
     from keras.optimizers import AdamAnneal
