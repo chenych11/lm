@@ -29,10 +29,11 @@ import cPickle as pickle
 from scipy.sparse import hstack as sp_hstack, vstack as sp_vstack, csr_matrix
 # from profilehooks import profile
 import scipy.sparse as sparse
-from multiprocessing import Queue, Process, Array
+from multiprocessing import Queue, Process, Array, Event as MEvent
 from threading import Thread, Lock, Event
 from scipy import stats
 import ctypes
+import numba
 
 floatX = theano.config.floatX
 logger = logging.getLogger('lm.real.models')
@@ -2864,9 +2865,9 @@ class LBLangModelV2(Graph, LangModel):
 
         self.jobs_pools = None
         self.jobs_pools_post = None
-        self.data_role_lock = Lock()
+        self.in_training_phase = Event()
         self.trn_finished = Event()
-        self.all_finished = Event()
+        self.all_finished = MEvent()
 
     def __del__(self):
         self.trn_finished.set()
@@ -3119,10 +3120,12 @@ class LBLangModelV2(Graph, LangModel):
         sp_pad_indptr = Array(ctypes.c_int32, self.sparse_coding_pad.indptr, lock=False)
 
         for _ in range(nb_data_workers):
-            # prepare_input(sents_queue, jobs_pools_post, vocab_size, batch_size, nb_negative, xk, pk,
+            # prepare_input(sents_queue, jobs_pool, all_finished,
+            #       vocab_size, context_size, batch_size, nb_negative, xk, pk,
             #       sp_data, sp_indices, sp_indptr, sp_shape,
-            #       sp_pad_data, sp_pad_indices, sp_pad_inptr, sp_pad_shape)
-            p = Process(target=prepare_input, args=(pre_data, post_data, self.all_finished, self.vocab_size, batch_size, self.nb_negative,
+            #       sp_pad_data, sp_pad_indices, sp_pad_inptr, sp_pad_shape):
+            p = Process(target=prepare_input, args=(pre_data, post_data, self.all_finished,
+                                                    self.vocab_size, self.context_size, batch_size, self.nb_negative,
                                                     xk, pk, sp_data, sp_indices, sp_indptr, self.sparse_coding.shape,
                                                     sp_pad_data, sp_pad_indices, sp_pad_indptr, self.sparse_coding_pad.shape))
             p.daemon = True
@@ -3141,9 +3144,11 @@ class LBLangModelV2(Graph, LangModel):
                 chunk = chunk_sentences(sentences, sents, batch_size)
                 if chunk is None:
                     continue
-                with self.data_role_lock:
-                    pre_data.put(chunk)
+                self.in_training_phase.wait()
+                pre_data.put(chunk)
+
             self.trn_finished.set()
+            logger.debug('trn data finished')
 
         gen_chunk_thread = Thread(target=chunk_trn_generator)
         gen_chunk_thread.setDaemon(True)
@@ -3154,6 +3159,7 @@ class LBLangModelV2(Graph, LangModel):
         nb_cyc = 0
         start_ = time()
         next_val_time = start_ + validation_interval
+        self.in_training_phase.set()
 
         while not self.trn_finished.is_set() or not post_data.empty():
             ins = post_data.get()
@@ -3165,7 +3171,7 @@ class LBLangModelV2(Graph, LangModel):
             #         continue
             loss_ = self._train(*ins)
             nb_cyc += 1
-            nb_cyc %= 10
+            nb_cyc %= 20
             nb_words_trained += ins[0].shape[0]
             nb_chunk += ins[0].shape[0]
             loss += loss_ * ins[0].shape[0]
@@ -3184,29 +3190,34 @@ class LBLangModelV2(Graph, LangModel):
                 loss = 0.0
 
                 if end_ > next_val_time:
-                    self.data_role_lock.acquire()
+                    logger.debug('pausing training data generation and consuming all generated data')
+                    self.in_training_phase.clear()
                     while not self.jobs_pools_post.empty() or not self.jobs_pools.empty():
                         ins = self.jobs_pools_post.get()
                         self._train(*ins)
-                    self.data_role_lock.release()
+                    logger.debug('Before validation')
                     # noinspection PyUnresolvedReferences
                     self.validation(train_val_sents, log_file)
+                    logger.debug('END validation. resume training data generation')
+                    self.in_training_phase.set()
                     next_val_time = time() + validation_interval
 
             if nb_words_trained >= train_nb_words:
                 self.trn_finished.set()
                 break
 
-        self.data_role_lock.acquire()
+        # consume all the produced tasks. The data generation thread will automatically shutdown, for the trn_finished
+        # event is set.
+        self.in_training_phase.set()  # make sure it is not blocking
         while not self.jobs_pools_post.empty() or not self.jobs_pools.empty():
             ins = self.jobs_pools_post.get()
             self._train(*ins)
-        self.data_role_lock.release()
 
+        # Now the training data is consumed out. Let's evaluate...
         logger.info('Training finished. Evaluating ...')
         log_file.info('Training finished. Evaluating ...')
         self.validation(val_sents, log_file)
-        self.all_finished.set()
+        self.all_finished.set()  # signal the all_finished event to shutdown all worker processes.
         if save_path is not None:
             self.save_params(save_path)
         log_file.close()
@@ -3231,15 +3242,14 @@ class LBLangModelV2(Graph, LangModel):
         loss = 0.0
 
         def chunk_val_generator():
-            with self.data_role_lock:
-                for sents in val_sents:
-                    self.jobs_pools.put(sents)
-
+            for sents in val_sents:
+                self.jobs_pools.put(sents)
 
         gen_chunk_thread = Thread(target=chunk_val_generator)
         gen_chunk_thread.setDaemon(True)
         gen_chunk_thread.start()
 
+        logger.debug('begin val loop')
         while True:
             ins = self.jobs_pools_post.get()
             loss_, code_len_, nb_words_ = self._test(*ins)
@@ -3248,6 +3258,7 @@ class LBLangModelV2(Graph, LangModel):
             loss += loss_ * nb_words_
             if self.jobs_pools_post.empty() and self.jobs_pools.empty():
                 break
+        logger.debug('end val loop')
 
         loss /= nb_words
         ppl = math.exp(code_len/nb_words)
@@ -3323,8 +3334,36 @@ def negative_sampleLBLV2(y, sampler, nb_negative):
         return ret
 
 
-def prepare_input(sents_queue,  jobs_pool, is_trn_lock,
-                  vocab_size, batch_size, nb_negative, xk, pk,
+# @numba.jit([(numba.int32[:, :], numba.int32, numba.int32),
+#             (numba.int32[:, :], numba.int64, numba.int32),
+#             (numba.int32[:, :], numba.int32, numba.int64),
+#             (numba.int32[:, :], numba.int64, numba.int64)], nogil=True)
+@numba.jit
+def get_cntx_label(sents, vocab_size, context_size):
+    ns = sents.shape[0]
+    nt = sents.shape[1]
+    nb_ele = sents.size  # NO. of words in the sentences.
+
+    pad_idx = np.arange(vocab_size, vocab_size+context_size).reshape((1, -1))
+    pad_idx = pad_idx.repeat(ns, axis=0)  # (ns, c), where c is context size
+    idxes = np.hstack((pad_idx, sents))   # (ns, c+s), where s is sentence length
+
+    X = np.empty(shape=(nb_ele, context_size), dtype='int32')
+    y_label = np.empty(shape=(nb_ele, ), dtype='int32')
+    start_end = np.array([0, 0], dtype='int32')
+    k = 0
+    for i in range(ns):  # loop on sentences
+        start_end[0], start_end[1] = 0, context_size
+        for _ in range(nt):  # loop on time (each time step corresponds to a word)
+            X[k] = idxes[i, start_end[0]:start_end[1]]
+            y_label[k] = idxes[i, start_end[1]]
+            k += 1
+            start_end += 1
+    return X, y_label
+
+
+def prepare_input(sents_queue, jobs_pool, all_finished,
+                  vocab_size, context_size, batch_size, nb_negative, xk, pk,
                   sp_data, sp_indices, sp_indptr, sp_shape,
                   sp_pad_data, sp_pad_indices, sp_pad_inptr, sp_pad_shape):
     xk = np.frombuffer(xk, dtype='int32')
@@ -3337,29 +3376,9 @@ def prepare_input(sents_queue,  jobs_pool, is_trn_lock,
     sp_pad_inptr = np.frombuffer(sp_pad_inptr, dtype='int32')
     sparse_coding = sparse.csr_matrix((sp_data, sp_indices, sp_indptr), shape=sp_shape)
     sparse_coding_pad = sparse.csr_matrix((sp_pad_data, sp_pad_indices, sp_pad_inptr), shape=sp_pad_shape)
-    while not is_trn_lock.is_set() or not sents_queue.empty():
+    while not all_finished.is_set() or not sents_queue.empty():
         sents = sents_queue.get()
-
-        ns = sents.shape[0]
-        nt = sents.shape[1]
-        nb_ele = sents.size  # NO. of words in the sentences.
-
-        pad_idx = np.arange(vocab_size, vocab_size+context_size).reshape((1, -1))
-        pad_idx = pad_idx.repeat(ns, axis=0)  # (ns, c), where c is context size
-        idxes = np.hstack((pad_idx, sents))   # (ns, c+s), where s is sentence length
-
-        X = np.empty(shape=(nb_ele, context_size), dtype='int32')
-        y_label = np.empty(shape=(nb_ele, ), dtype='int32')
-        start_end = np.array([0, 0], dtype='int32')
-        k = 0
-        for i in range(ns):  # loop on sentences
-            start_end[0], start_end[1] = 0, context_size
-            for _ in range(nt):  # loop on time (each time step corresponds to a word)
-                X[k] = idxes[i, start_end[0]:start_end[1]]
-                y_label[k] = idxes[i, start_end[1]]
-                k += 1
-                start_end += 1
-
+        X, y_label = get_cntx_label(sents, vocab_size, context_size)
         custm = stats.rv_discrete(name='custm', values=(xk, pk))
         y_label = negative_sampleLBLV2(y_label, custm, nb_negative)
 
@@ -3421,7 +3440,8 @@ if __name__ == '__main__':
     #model.train_from_dir(data_fn=data_path, validation_split=0., batch_size=256, verbose=1)
     model.train(data_file=data_path,
                 save_path='../data/models/lang/nce-lbl-e200-c200-lr0.01-lr_min0.001-gamma0.03-d-test.pkl',
-                batch_size=512, train_nb_words=100000000,
-                val_nb_words=5000000, train_val_nb=100000,
+                batch_size=512, train_nb_words=1000000,
+                val_nb_words=50000, train_val_nb=1000,
+                validation_interval=60,
                 log_file='../logs/nce-lbl-e200-c200-lr0.01-lr_min0.001-gamma0.03-d-test.log')
     #model.profile_model()
