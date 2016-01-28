@@ -19,7 +19,8 @@ from keras.layers.core import Reshape
 # from keras.regularizers import l2
 from layers import LangLSTMLayer, PartialSoftmax, Split, LookupProb, PartialSoftmaxV1, \
     TreeLogSoftmax, SparseEmbedding, Identity, PartialSoftmaxV4, SharedWeightsDense, \
-    LangLSTMLayerV5, LangLSTMLayerV6, SparseEmbeddingV6, EmbeddingParam, LBLScoreV1, PartialSoftmaxLBL
+    LangLSTMLayerV5, LangLSTMLayerV6, SparseEmbeddingV6, EmbeddingParam, LBLScoreV1, \
+    PartialSoftmaxLBL, PartialSoftmaxLBLV4, SharedWeightsDenseLBLV4, PartialSoftmaxFFNN
 from utils import LangHistory, LangModelLogger, categorical_crossentropy, objective_fnc, \
     TableSampler, slice_X, chunk_sentences, epsilon
 # noinspection PyUnresolvedReferences
@@ -30,10 +31,11 @@ from scipy.sparse import hstack as sp_hstack, vstack as sp_vstack, csr_matrix
 # from profilehooks import profile
 import scipy.sparse as sparse
 from multiprocessing import Queue, Process, Array, Event as MEvent
-from threading import Thread, Lock, Event
+from threading import Thread, Event
 from scipy import stats
 import ctypes
 import numba
+import os
 
 floatX = theano.config.floatX
 logger = logging.getLogger('lm.real.models')
@@ -1397,11 +1399,11 @@ class NCELangModelV4(Graph, LangModel):
 
         if negprob_table is None:
             negprob_table_ = np.ones(shape=(vocab_size,), dtype=theano.config.floatX)/vocab_size
-            negprob_table = theano.shared(negprob_table_)
+            negprob_table = theano.shared(negprob_table_, borrow=True)
             self.neg_prob_table = negprob_table_
         else:
             self.neg_prob_table = negprob_table.astype(theano.config.floatX)
-            negprob_table = theano.shared(negprob_table.astype(theano.config.floatX))
+            negprob_table = theano.shared(self.neg_prob_table, borrow=True)
 
         self.sampler = TableSampler(self.neg_prob_table)
 
@@ -2913,9 +2915,8 @@ class LBLangModelV2(Graph, LangModel):
         neg_prob_tst = neg_prob_layer.get_output(train=False) * self.nb_negative
         pre_prob_tst = pre_prob_layer.get_output(train=False)
 
-        pos_prob_trn = T.clip(pos_prob_trn, epsilon, 1.0 - epsilon)
-        pos_prob_tst = T.clip(pos_prob_tst, epsilon, 1.0 - epsilon)
-        pre_prob_tst = T.clip(pre_prob_tst, epsilon, 1.0 - epsilon)
+        pre_prob_tst = T.clip(pre_prob_tst, epsilon, 1.-epsilon)
+        pre_prob_tst = pre_prob_tst / T.sum(pre_prob_tst, axis=-1, keepdims=True)
 
         # nrm_const = normlzer_layer.get_output(train=True)
         # nrm_const = T.reshape(nrm_const, (nrm_const.shape[0], nrm_const.shape[1]))
@@ -2928,15 +2929,15 @@ class LBLangModelV2(Graph, LangModel):
         # pos_prob_tst *= nrm_const_tst
 
         #TODO: mask not supported here
-        eps = 1.0e-10
+        # eps = 1.0e-10
         nb_words = pos_prob_trn[0].size.astype(floatX)
         nb_words_ = pos_prob_tst[0].size.astype(floatX)
         sum_pos_neg_trn = pos_prob_trn + neg_prob_trn
         sum_pos_neg_tst = pos_prob_tst + neg_prob_tst
-        y_train = T.sum(T.log(eps+pos_prob_trn[0] / sum_pos_neg_trn[0])) / nb_words
-        y_train += T.sum(T.log(eps+neg_prob_trn[1:] / sum_pos_neg_trn[1:])) / nb_words
-        y_test = T.sum(T.log(eps+pos_prob_tst[0] / sum_pos_neg_tst[0])) / nb_words_
-        y_test += T.sum(T.log(eps+neg_prob_tst[1:] / sum_pos_neg_tst[1:])) / nb_words_
+        y_train = T.sum(T.log(T.clip(pos_prob_trn[0]/sum_pos_neg_trn[0], epsilon, 1.-epsilon))) / nb_words
+        y_train += T.sum(T.log(T.clip(neg_prob_trn[1:]/sum_pos_neg_trn[1:], epsilon, 1.-epsilon))) / nb_words
+        y_test = T.sum(T.log(T.clip(pos_prob_tst[0]/sum_pos_neg_tst[0], epsilon, 1.-epsilon))) / nb_words_
+        y_test += T.sum(T.log(T.clip(neg_prob_tst[1:] / sum_pos_neg_tst[1:], epsilon, 1.-epsilon))) / nb_words_
 
         input0 = self.inputs['ngrams'].get_output(True)
         input1 = self.inputs['label_with_neg'].get_output(True)
@@ -3329,6 +3330,1134 @@ class LBLangModelV2(Graph, LangModel):
     #             break
 
 
+class LBLangModelV3(Graph, LangModel):
+    # the standard LBL language model with sparse coding extension, ZRegression
+    def __init__(self, sparse_coding, context_size, nb_negative, embed_dims=200, init_embeddings=None,
+                 negprob_table=None, optimizer='adam'):
+        super(LBLangModelV3, self).__init__()
+        self.nb_negative = nb_negative
+        self.sparse_coding = sparse_coding
+        vocab_size = sparse_coding.shape[0]  # the extra word is for OOV
+        self.nb_base = sparse_coding.shape[1] - 1
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dims
+        # self.loss = categorical_crossentropy
+        # self.loss_fnc = objective_fnc(self.loss)
+        self.optimizer = optimizers.get(optimizer)
+        self.context_size = context_size
+        self.weights = None
+        # self.max_sent_len = max_sent_len
+        tmp1 = sparse.csr_matrix((self.vocab_size, context_size), dtype=floatX)
+        tmp2 = sparse.csr_matrix((context_size, self.nb_base+1), dtype=floatX)
+        tmp3 = sparse.vstack([tmp1, sparse.csr_matrix(np.eye(context_size, dtype=floatX))])
+        tmp4 = sparse.vstack([self.sparse_coding, tmp2])
+        self.sparse_coding_pad = sparse.hstack([tmp4, tmp3], format='csr')
+
+        if negprob_table is None:
+            negprob_table_ = np.ones(shape=(vocab_size,), dtype=theano.config.floatX)/vocab_size
+            self.neg_prob_table = negprob_table_
+        else:
+            nrm = np.sum(negprob_table)
+            if nrm != 1.0:
+                logger.warn('Sampling table not normalized! sum to: %.6f' % nrm)
+                negprob_table /= nrm
+            self.neg_prob_table = negprob_table.astype(theano.config.floatX)
+
+        # self.sampler = TableSampler(self.neg_prob_table)
+
+        self.add_input(name='ngrams', ndim=2, dtype='int32')          # (ns, c), where c is the context size
+        self.add_input(name='label_with_neg', ndim=2, dtype='int32')  # (k+1, ns)
+        self.add_input(name='lookup_prob', ndim=2, dtype=floatX)      # (k+1, ns)
+
+        cntx_codes = tsp.csr_matrix('cntx-codes', dtype=floatX)
+        label_codes = tsp.csr_matrix('label_codes', dtype=floatX)
+        cntx_idxes = self.inputs['ngrams'].get_output()
+        batch_shape = cntx_idxes.shape
+
+        self.add_node(Identity(inputs={True: cntx_codes, False: cntx_codes}), name='cntx_codes_flat')
+        self.add_node(Identity(inputs={True: label_codes, False: label_codes}), name='label_codes_flat')
+        self.add_node(Identity(inputs={True: batch_shape, False: batch_shape}), name='cntx_shape')
+        # self.add_node(Identity(inputs={True: codes, False: codes}), name='sparse_codes')
+
+        self.add_node(SparseEmbedding(self.nb_base+self.context_size+1, embed_dims, weights=init_embeddings),
+                      name='embedding', inputs=('cntx_codes_flat', 'cntx_shape'))
+        self.add_node(EmbeddingParam(), name='embedding_param', inputs='embedding')
+        self.add_node(Reshape(-1), name='reshape', inputs='embedding')
+        composer_node = Dense(context_size*embed_dims, embed_dims)
+        composer_node.params = [composer_node.W]   # drop the bias parameters
+        composer_node.get_output = lambda train: node_get_output(composer_node, train)
+        self.add_node(composer_node, name='context_vec', inputs='reshape')
+        self.add_node(PartialSoftmaxLBL(base_size=self.nb_base+1,
+                                        word_vecs=self.nodes['embedding'].W),
+                      name='part_prob', inputs=('label_with_neg', 'label_codes_flat', 'context_vec'))
+        self.add_node(Dense(input_dim=embed_dims, output_dim=1, activation='exponential'),
+                      name='normalizer', inputs='context_vec')
+        self.add_node(SharedWeightsDense(self.nodes['part_prob'].W,
+                                         self.nodes['part_prob'].b,
+                                         self.sparse_coding, activation='softmax'),
+                      name='true_prob', inputs='context_vec')
+
+        self.add_output('pos_prob', node='part_prob')
+        self.add_output('neg_prob', node='lookup_prob')
+        self.add_output('pred_prob', node='true_prob')
+        self.add_output('normalizer', node='normalizer')
+
+        def node_get_output(layer, train=False):
+            X = layer.get_input(train)
+            output = T.dot(X, layer.W)  # there is no activation.
+            return output
+
+        self.fit = None
+
+        self.jobs_pools = None
+        self.jobs_pools_post = None
+        self.in_training_phase = Event()
+        self.trn_finished = Event()
+        self.all_finished = MEvent()
+
+    def __del__(self):
+        self.trn_finished.set()
+        self.all_finished.set()
+
+
+    @staticmethod
+    def encode_length(y_label, y_pred, mask=None):
+        """
+        :param y_label: true index labels with shape (ns, )
+        :param y_pred: predicted probabilities with shape (ns, V)
+        :param mask: mask
+        :return: PPL
+        """
+        ## there is no need to clip here, for the prob. have already clipped by LBLayer
+        # epsilon = 1e-7
+        # y_pred = T.clip(y_pred, epsilon, 1.0 - epsilon)
+        # # scale preds so that the class probas of each sample sum to 1
+        # y_pred /= y_pred.sum(axis=-1, keepdims=True)
+
+        nb_samples = y_label.shape[0]
+        idx = T.arange(nb_samples)
+        probs_ = y_pred[idx, y_label]
+
+        return -T.sum(T.log(probs_)), nb_samples
+
+    # noinspection PyMethodOverriding
+    def compile(self, optimizer=None):
+        # from theano.compile.nanguardmode import NanGuardMode
+        if optimizer is not None:
+            logger.info('compiling with %s' % optimizer)
+            self.optimizer = optimizers.get(optimizer)
+        # output of model
+        pos_prob_layer = self.outputs['pos_prob']
+        neg_prob_layer = self.outputs['neg_prob']
+        pre_prob_layer = self.outputs['pred_prob']
+        normlzer_layer = self.outputs['normalizer']
+
+        pos_prob_trn = pos_prob_layer.get_output(train=True)     # (k+1, ns)
+        neg_prob_trn = neg_prob_layer.get_output(train=True) * self.nb_negative
+        pos_prob_tst = pos_prob_layer.get_output(train=False)
+        neg_prob_tst = neg_prob_layer.get_output(train=False) * self.nb_negative
+        pre_prob_tst = pre_prob_layer.get_output(train=False)
+
+        nrm_const = normlzer_layer.get_output(train=True)        # (ns, 1)
+        nrm_const = T.reshape(nrm_const, (nrm_const.shape[0],))  # (ns, )
+        nrm_const = nrm_const.dimshuffle('x', 0)                 # (1, ns)
+        pos_prob_trn *= nrm_const
+
+        nrm_const_tst = normlzer_layer.get_output(train=False)
+        nrm_const_tst = T.reshape(nrm_const_tst, (nrm_const_tst.shape[0], ))
+        nrm_const_tst = nrm_const_tst.dimshuffle('x', 0)
+        pos_prob_tst *= nrm_const_tst
+
+        pre_prob_tst = T.clip(pre_prob_tst, epsilon, 1.-epsilon)
+        pre_prob_tst = pre_prob_tst / T.sum(pre_prob_tst, axis=-1, keepdims=True)
+
+        #TODO: mask not supported here
+
+        nb_words = pos_prob_trn[0].size.astype(floatX)
+        nb_words_ = pos_prob_tst[0].size.astype(floatX)
+        # sum_pos_neg_trn = pos_prob_trn + neg_prob_trn
+        # sum_pos_neg_tst = pos_prob_tst + neg_prob_tst
+        # y_train = T.sum(T.log(T.clip(pos_prob_trn[0]/sum_pos_neg_trn[0], epsilon, 1.-epsilon))) / nb_words
+        # y_train += T.sum(T.log(T.clip(neg_prob_trn[1:]/sum_pos_neg_trn[1:], epsilon, 1.-epsilon))) / nb_words
+        # y_test = T.sum(T.log(T.clip(pos_prob_tst[0]/sum_pos_neg_tst[0], epsilon, 1.-epsilon))) / nb_words_
+        # y_test += T.sum(T.log(T.clip(neg_prob_tst[1:] / sum_pos_neg_tst[1:], epsilon, 1.-epsilon))) / nb_words_
+
+        eps = 1.0e-10
+        sum_pos_neg_trn = pos_prob_trn + neg_prob_trn + 2*eps
+        sum_pos_neg_tst = pos_prob_tst + neg_prob_tst + 2*eps
+        y_train = T.sum(T.log((pos_prob_trn[0]+eps)/sum_pos_neg_trn[0]))
+        y_train += T.sum(T.log((neg_prob_trn[1:]+eps)/sum_pos_neg_trn[1:]))
+        y_train /= nb_words
+        y_test = T.sum(T.log((pos_prob_tst[0]+eps)/sum_pos_neg_tst[0]))
+        y_test += T.sum(T.log((neg_prob_tst[1:]+eps) / sum_pos_neg_tst[1:]))
+        y_test /= nb_words_
+
+        input0 = self.inputs['ngrams'].get_output(True)
+        input1 = self.inputs['label_with_neg'].get_output(True)
+        input2 = self.nodes['cntx_codes_flat'].get_output(True)
+        input3 = self.nodes['label_codes_flat'].get_output(True)
+        input4 = self.inputs['lookup_prob'].get_output(True)
+
+        true_labels = input1[0]
+        encode_len, nb_words = self.encode_length(true_labels, pre_prob_tst)
+
+        train_loss = -y_train
+        test_loss = -y_test
+        train_loss.name = 'train_loss'
+        test_loss.name = 'test_loss'
+
+        for r in self.regularizers:
+            train_loss = r(train_loss)
+        updates = self.optimizer.get_updates(self.params, self.constraints, train_loss)
+        updates += self.updates
+
+        train_ins = [input0, input1, input2, input3, input4]
+        test_ins = [input0, input1, input2, input3, input4]
+
+        self._train = theano.function(train_ins, train_loss, updates=updates)
+        self._train.out_labels = ['loss']
+        self._test = theano.function(test_ins, [test_loss, encode_len, nb_words])
+        self._test.out_labels = ['loss', 'encode_len', 'nb_words']
+
+        self.all_metrics = ['loss', 'ppl', 'val_loss', 'val_ppl']
+
+        def __summary_outputs(outs, batch_sizes):
+            out = np.array(outs, dtype=theano.config.floatX)
+            loss, encode_len, nb_words = out
+            batch_size = np.array(batch_sizes, dtype=theano.config.floatX)
+
+            smry_loss = np.sum(loss * batch_size)/batch_size.sum()
+            smry_encode_len = encode_len.sum()
+            smry_nb_words = nb_words.sum()
+            return [smry_loss, smry_encode_len, smry_nb_words]
+
+        self._train.summarize_outputs = __summary_outputs
+        self._test.summarize_outputs = __summary_outputs
+
+    def train(self, data_file='../data/corpus/wiki-sg-norm-lc-drop-bin-sample.bz2', save_path=None,
+              batch_size=256, train_nb_words=100000000, val_nb_words=100000, train_val_nb=100000,
+              validation_interval=1800, log_file=None, nb_data_workers=6, data_pool_size=10):
+        opt_info = self.optimizer.get_config()
+        opt_info = ', '.join(["{}: {}".format(n, v) for n, v in opt_info.items()])
+
+        logger.info('training with file: %s' % data_file)
+        logger.info('training with batch size %d' % batch_size)
+        logger.info('training with %d words; validate with %d words during training; '
+                    'evaluate with %d words after training' % (train_nb_words, train_val_nb, val_nb_words))
+        logger.info('validate every %f seconds' % float(validation_interval))
+        logger.info('optimizer: %s' % opt_info)
+
+        log_file = LogInfo(log_file)
+        log_file.info('training with file: %s' % data_file)
+        log_file.info('training with batch size %d' % batch_size)
+        log_file.info('training with %d words; validate with %d words during training; '
+                      'evaluate with %d words after training' % (train_nb_words, train_val_nb, val_nb_words))
+        log_file.info('validate every %f seconds' % float(validation_interval))
+        log_file.info('optimizer: %s' % opt_info)
+
+        sentences = [None for _ in range(MAX_SETN_LEN)]  # TODO: sentences longer than 64 are ignored.
+
+        max_vocab = self.vocab_size - 1
+        nb_words_trained = 0.0
+        sent_gen = grouped_sentences(data_file)
+        val_sents = self.get_val_data(sent_gen, val_nb_words)
+        train_val_sents = self.get_val_data(sent_gen, train_val_nb)
+
+        data_workers = []
+        pre_data = Queue(data_pool_size)
+        post_data = Queue(data_pool_size*30)
+        self.jobs_pools = pre_data
+        self.jobs_pools_post = post_data
+
+        xk = Array(ctypes.c_int32, np.arange(self.vocab_size, dtype='int32'), lock=False)
+        # a_type = ctypes.c_double if str(self.neg_prob_table.dtype) == 'float64' else ctypes.c_float
+        assert str(self.neg_prob_table.dtype) == 'float32'
+        pk = Array(ctypes.c_float, self.neg_prob_table, lock=False)
+
+        # a_type = ctypes.c_double if str(self.sparse_coding.dtype) == 'float64' else ctypes.c_float
+        assert str(self.sparse_coding.dtype) == 'float32'
+        sp_data = Array(ctypes.c_float, self.sparse_coding.data, lock=False)
+        assert str(self.sparse_coding.indices.dtype) == 'int32'
+        assert str(self.sparse_coding.indptr.dtype) == 'int32'
+        sp_indices = Array(ctypes.c_int32, self.sparse_coding.indices, lock=False)
+        sp_indptr = Array(ctypes.c_int32, self.sparse_coding.indptr, lock=False)
+
+        # a_type = ctypes.c_double if str(self.sparse_coding_pad.dtype) == 'float64' else ctypes.c_float
+        assert str(self.sparse_coding_pad.dtype) == 'float32'
+        sp_pad_data = Array(ctypes.c_float, self.sparse_coding_pad.data, lock=False)
+        assert str(self.sparse_coding_pad.indices.dtype) == 'int32'
+        assert str(self.sparse_coding_pad.indptr.dtype) == 'int32'
+        sp_pad_indices = Array(ctypes.c_int32, self.sparse_coding_pad.indices, lock=False)
+        sp_pad_indptr = Array(ctypes.c_int32, self.sparse_coding_pad.indptr, lock=False)
+
+        for _ in range(nb_data_workers):
+            # prepare_input(sents_queue, jobs_pool, all_finished,
+            #       vocab_size, context_size, batch_size, nb_negative, xk, pk,
+            #       sp_data, sp_indices, sp_indptr, sp_shape,
+            #       sp_pad_data, sp_pad_indices, sp_pad_inptr, sp_pad_shape):
+            p = Process(target=prepare_input, args=(pre_data, post_data, self.all_finished,
+                                                    self.vocab_size, self.context_size, batch_size, self.nb_negative,
+                                                    xk, pk, sp_data, sp_indices, sp_indptr, self.sparse_coding.shape,
+                                                    sp_pad_data, sp_pad_indices, sp_pad_indptr, self.sparse_coding_pad.shape))
+            p.daemon = True
+            data_workers.append(p)
+            p.start()
+
+        self.in_training_phase.clear()
+        self.validation(train_val_sents, log_file)
+
+        def chunk_trn_generator():
+            for sents in sent_gen:
+                if self.trn_finished.is_set():
+                    break
+
+                mask = (sents > max_vocab)
+                sents[mask] = max_vocab
+                chunk = chunk_sentences(sentences, sents, batch_size)
+                if chunk is None:
+                    continue
+                self.in_training_phase.wait()
+                pre_data.put(chunk)
+
+            self.trn_finished.set()
+            logger.debug('trn data finished')
+
+        gen_chunk_thread = Thread(target=chunk_trn_generator)
+        gen_chunk_thread.setDaemon(True)
+        gen_chunk_thread.start()
+
+        loss = 0.0
+        nb_chunk = 0.0
+        nb_cyc = 0
+        start_ = time()
+        next_val_time = start_ + validation_interval
+        self.in_training_phase.set()
+
+        while not self.trn_finished.is_set() or not post_data.empty():
+            ins = post_data.get()
+            # if ins is None:
+            #     if nb_none == nb_data_workers:
+            #         break
+            #     else:
+            #         nb_none += 1
+            #         continue
+            loss_ = self._train(*ins)
+            nb_cyc += 1
+            nb_cyc %= 20
+            nb_words_trained += ins[0].shape[0]
+            nb_chunk += ins[0].shape[0]
+            loss += loss_ * ins[0].shape[0]
+            if nb_cyc == 0:
+                end_ = time()
+                elapsed = float(end_ - start_)
+                speed2 = nb_words_trained/elapsed
+                eta = (train_nb_words - nb_words_trained) / speed2
+                eta_h = int(math.floor(eta/3600))
+                eta_m = int(math.ceil((eta - eta_h * 3600)/60.))
+                loss /= nb_chunk
+                logger.info('%s:Train - ETA: %02d:%02d - loss: %5.3f - speed: %.1f words/s' %
+                            (self.__class__.__name__, eta_h, eta_m, loss, speed2))
+                log_file.info('%s:Train - time: %f - loss: %.6f' % (self.__class__.__name__, end_, loss))
+                nb_chunk = 0.0
+                loss = 0.0
+
+                if end_ > next_val_time:
+                    logger.debug('pausing training data generation and consuming all generated data')
+                    self.in_training_phase.clear()
+                    while not self.jobs_pools_post.empty() or not self.jobs_pools.empty():
+                        ins = self.jobs_pools_post.get()
+                        self._train(*ins)
+                    logger.debug('Before validation')
+                    # noinspection PyUnresolvedReferences
+                    self.validation(train_val_sents, log_file)
+                    logger.debug('END validation. resume training data generation')
+                    self.in_training_phase.set()
+                    next_val_time = time() + validation_interval
+
+            if nb_words_trained >= train_nb_words:
+                self.trn_finished.set()
+                break
+
+        # consume all the produced tasks. The data generation thread will automatically shutdown, for the trn_finished
+        # event is set.
+        self.in_training_phase.set()  # make sure it is not blocking
+        while not self.jobs_pools_post.empty() or not self.jobs_pools.empty():
+            ins = self.jobs_pools_post.get()
+            self._train(*ins)
+
+        # Now the training data is consumed out. Let's evaluate...
+        logger.info('Training finished. Evaluating ...')
+        log_file.info('Training finished. Evaluating ...')
+        self.validation(val_sents, log_file)
+        self.all_finished.set()  # signal the all_finished event to shutdown all worker processes.
+        if save_path is not None:
+            self.save_params(save_path)
+        log_file.close()
+
+        for _ in range(10):
+            flags = map(Process.is_alive, data_workers)
+            if not any(flags):
+                break
+            for flag, p in zip(flags, data_workers):
+                if flag is True:
+                    logger.info("%s is alive" % p.name)
+            sleep(5)
+
+    def validation(self, val_sents, log_file=None):
+        """
+        :param val_sents: validation sentences.
+        :type val_sents: a list, each element a ndarray
+        :return: tuple
+        """
+        code_len = 0.
+        nb_words = 0.
+        loss = 0.0
+
+        def chunk_val_generator():
+            for sents in val_sents:
+                self.jobs_pools.put(sents)
+
+        gen_chunk_thread = Thread(target=chunk_val_generator)
+        gen_chunk_thread.setDaemon(True)
+        gen_chunk_thread.start()
+
+        logger.debug('begin val loop')
+        while True:
+            ins = self.jobs_pools_post.get()
+            loss_, code_len_, nb_words_ = self._test(*ins)
+            nb_words += nb_words_
+            code_len += code_len_
+            loss += loss_ * nb_words_
+            if self.jobs_pools_post.empty() and self.jobs_pools.empty():
+                break
+        logger.debug('end val loop')
+
+        loss /= nb_words
+        ppl = math.exp(code_len/nb_words)
+
+        logger.info('%s:Val val_loss: %.2f - val_ppl: %.2f' % (self.__class__.__name__, loss, ppl))
+        log_file.info('%s:Val val_loss: %.6f - val_ppl: %.6f' % (self.__class__.__name__, loss, ppl))
+
+        return loss, ppl
+
+
+class LBLangModelV4(Graph, LangModel):
+    # the standard LBL language model with NCE
+    def __init__(self, vocab_size, context_size, embed_dims=128, nb_negative=50, negprob_table=None, optimizer='adam'):
+        super(LBLangModelV4, self).__init__()
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dims
+        self.nb_negative = nb_negative
+        # self.loss = categorical_crossentropy
+        # self.loss_fnc = objective_fnc(self.loss)
+        self.optimizer = optimizers.get(optimizer)
+        self.context_size = context_size
+        self.weights = None
+
+        if negprob_table is None:
+            negprob_table_ = np.ones(shape=(vocab_size,), dtype=theano.config.floatX)/vocab_size
+            self.neg_prob_table = negprob_table_
+        else:
+            self.neg_prob_table = negprob_table.astype(theano.config.floatX)
+
+        self.sampler = TableSampler(self.neg_prob_table)
+        # self.max_sent_len = max_sent_len
+
+        self.add_input(name='ngrams', ndim=2, dtype='int32')          # (ns, c)
+        self.add_input(name='label_with_neg', ndim=2, dtype='int32')  # (k+1, ns)
+        self.add_input(name='lookup_prob', ndim=2, dtype=floatX)      # (k+1, ns)
+
+        self.add_node(Embedding(vocab_size+context_size, embed_dims), name='embedding', inputs='ngrams')
+        self.add_node(EmbeddingParam(), name='embedding_param', inputs='embedding')
+        self.add_node(Reshape(-1), name='reshape', inputs='embedding')
+        composer_node = Dense(context_size*embed_dims, embed_dims)
+        composer_node.params = [composer_node.W]   # drop the bias parameters
+        # replace the default behavior of Dense
+        composer_node.get_output = lambda train: node_get_output(composer_node, train)
+        self.add_node(composer_node, name='context_vec', inputs='reshape')
+        self.add_node(PartialSoftmaxLBLV4(embed_dims, self.vocab_size,
+                                          word_vecs=self.nodes['embedding'].W[:vocab_size]),
+                      name='part_prob', inputs=('label_with_neg', 'context_vec'))
+        self.add_node(Dense(input_dim=embed_dims, output_dim=1, activation='exponential'),
+                      name='normalizer', inputs='context_vec')
+        self.add_node(SharedWeightsDenseLBLV4(self.nodes['part_prob'].W,
+                                              self.nodes['part_prob'].b,
+                                              activation='softmax'),
+                      name='true_prob', inputs='context_vec')
+
+        self.add_output('pos_prob', node='part_prob')
+        self.add_output('neg_prob', node='lookup_prob')
+        self.add_output('pred_prob', node='true_prob')
+        self.add_output('normalizer', node='normalizer')
+
+        def node_get_output(layer, train=False):
+            X = layer.get_input(train)
+            output = T.dot(X, layer.W)  # there is no activation.
+            return output
+
+        self.fit = None
+
+    @staticmethod
+    def encode_length(y_label, y_pred, mask=None):
+        """
+        :param y_label: true index labels with shape (ns, )
+        :param y_pred: predicted probabilities with shape (ns, V)
+        :param mask: mask
+        :return: PPL
+        """
+        ## there is no need to clip here, for the prob. have already clipped by LBLayer
+        # epsilon = 1e-7
+        # y_pred = T.clip(y_pred, epsilon, 1.0 - epsilon)
+        # # scale preds so that the class probas of each sample sum to 1
+        # y_pred /= y_pred.sum(axis=-1, keepdims=True)
+
+        nb_samples = y_label.shape[0]
+        idx = T.arange(nb_samples)
+        probs_ = y_pred[idx, y_label]
+
+        return -T.sum(T.log(probs_)), nb_samples
+
+    # noinspection PyMethodOverriding
+    def compile(self, optimizer=None):
+        # from theano.compile.nanguardmode import NanGuardMode
+        if optimizer is not None:
+            logger.info('compiling with %s' % optimizer)
+            self.optimizer = optimizers.get(optimizer)
+
+        pos_prob_layer = self.outputs['pos_prob']
+        neg_prob_layer = self.outputs['neg_prob']
+        pre_prob_layer = self.outputs['pred_prob']
+        normlzer_layer = self.outputs['normalizer']
+
+        pos_prob_trn = pos_prob_layer.get_output(train=True)     # (k+1, ns)
+        neg_prob_trn = neg_prob_layer.get_output(train=True) * self.nb_negative
+        pos_prob_tst = pos_prob_layer.get_output(train=False)
+        neg_prob_tst = neg_prob_layer.get_output(train=False) * self.nb_negative
+        pre_prob_tst = pre_prob_layer.get_output(train=False)
+
+        nrm_const = normlzer_layer.get_output(train=True)        # (ns, 1)
+        nrm_const = T.reshape(nrm_const, (nrm_const.shape[0],))  # (ns, )
+        nrm_const = nrm_const.dimshuffle('x', 0)                 # (1, ns)
+        pos_prob_trn *= nrm_const
+
+        nrm_const_tst = normlzer_layer.get_output(train=False)
+        nrm_const_tst = T.reshape(nrm_const_tst, (nrm_const_tst.shape[0], ))
+        nrm_const_tst = nrm_const_tst.dimshuffle('x', 0)
+        pos_prob_tst *= nrm_const_tst
+
+        pre_prob_tst = T.clip(pre_prob_tst, epsilon, 1.-epsilon)
+        pre_prob_tst = pre_prob_tst / T.sum(pre_prob_tst, axis=-1, keepdims=True)
+
+        #TODO: mask not supported here
+        # eps = 1.0e-10
+        nb_words = pos_prob_trn[0].size.astype(floatX)
+        nb_words_ = pos_prob_tst[0].size.astype(floatX)
+        # sum_pos_neg_trn = pos_prob_trn + neg_prob_trn
+        # sum_pos_neg_tst = pos_prob_tst + neg_prob_tst
+        #
+        # y_train = T.sum(T.log(T.clip(pos_prob_trn[0]/sum_pos_neg_trn[0], epsilon, 1.-epsilon))) / nb_words
+        # y_train += T.sum(T.log(T.clip(neg_prob_trn[1:]/sum_pos_neg_trn[1:], epsilon, 1.-epsilon))) / nb_words
+        # y_test = T.sum(T.log(T.clip(pos_prob_tst[0]/sum_pos_neg_tst[0], epsilon, 1.-epsilon))) / nb_words_
+        # y_test += T.sum(T.log(T.clip(neg_prob_tst[1:] / sum_pos_neg_tst[1:], epsilon, 1.-epsilon))) / nb_words_
+
+        eps = 1.0e-10
+        sum_pos_neg_trn = pos_prob_trn + neg_prob_trn + 2*eps
+        sum_pos_neg_tst = pos_prob_tst + neg_prob_tst + 2*eps
+        y_train = T.sum(T.log((pos_prob_trn[0]+eps)/sum_pos_neg_trn[0]))
+        y_train += T.sum(T.log((neg_prob_trn[1:]+eps)/sum_pos_neg_trn[1:]))
+        y_train /= nb_words
+        y_test = T.sum(T.log((pos_prob_tst[0]+eps)/sum_pos_neg_tst[0]))
+        y_test += T.sum(T.log((neg_prob_tst[1:]+eps) / sum_pos_neg_tst[1:]))
+        y_test /= nb_words_
+
+        train_loss = -y_train
+        test_loss = -y_test
+
+        input0 = self.inputs['ngrams'].get_output(True)
+        input1 = self.inputs['label_with_neg'].get_output(True)
+        input2 = self.inputs['lookup_prob'].get_output(True)
+
+        true_labels = input1[0]
+        encode_len, nb_words = self.encode_length(true_labels, pre_prob_tst)
+
+        for r in self.regularizers:
+            train_loss = r(train_loss)
+        updates = self.optimizer.get_updates(self.params, self.constraints, train_loss)
+        updates += self.updates
+
+        train_ins = test_ins = [input0, input1, input2]
+
+        self._train = theano.function(train_ins, train_loss, updates=updates)
+        self._train.out_labels = ['loss']
+        self._test = theano.function(test_ins, [test_loss, encode_len, nb_words])
+        self._test.out_labels = ['loss', 'encode_len', 'nb_words']
+
+        def __summary_outputs(outs, batch_sizes):
+            out = np.array(outs, dtype=theano.config.floatX)
+            loss, encode_len, nb_words = out
+            batch_size = np.array(batch_sizes, dtype=theano.config.floatX)
+
+            smry_loss = np.sum(loss * batch_size)/batch_size.sum()
+            smry_encode_len = encode_len.sum()
+            smry_nb_words = nb_words.sum()
+            return [smry_loss, smry_encode_len, smry_nb_words]
+
+        self._test.summarize_outputs = __summary_outputs
+
+    def negative_sample(self, X, order=0):
+        if order == 0:
+            ret = np.empty(shape=(self.nb_negative+1,) + X.shape, dtype=X.dtype)
+            ret[0] = X
+            ret[1:] = self.sampler.sample(shape=ret[1:].shape)
+        else:
+            raise NotImplementedError('Only support order=0 now')
+        return ret
+
+    @numba.jit
+    def prepare_input(self, sents):
+        ns = sents.shape[0]
+        nt = sents.shape[1]
+        nb_ele = sents.size  # NO. of words in the sentences.
+
+        pad_idx = np.arange(self.vocab_size, self.vocab_size+self.context_size).reshape((1, -1))
+        pad_idx = pad_idx.repeat(ns, axis=0)  # (ns, c), where c is context size
+        idxes = np.hstack((pad_idx, sents))   # (ns, c+s), where s is sentence length
+
+        X = np.empty(shape=(nb_ele, self.context_size), dtype='int32')
+        y_label = np.empty(shape=(nb_ele, ), dtype='int32')
+        start_end = np.array([0, 0], dtype='int32')
+        k = 0
+        for i in range(ns):  # loop on sentences
+            start_end[0], start_end[1] = 0, self.context_size
+            for _ in range(nt):  # loop on time (each time step corresponds to a word)
+                X[k] = idxes[i, start_end[0]:start_end[1]]
+                y_label[k] = idxes[i, start_end[1]]
+                k += 1
+                start_end += 1
+
+        y_label_neg = self.negative_sample(y_label)
+        neg_prob = self.neg_prob_table[y_label_neg]
+        return X, y_label_neg, neg_prob
+
+    def train(self, data_file='../data/corpus/wiki-sg-norm-lc-drop-bin-sample.bz2', save_path=None,
+              batch_size=256, train_nb_words=100000000, val_nb_words=100000, train_val_nb=100000,
+              validation_interval=1800, log_file=None):
+        opt_info = self.optimizer.get_config()
+        opt_info = ', '.join(["{}: {}".format(n, v) for n, v in opt_info.items()])
+
+        logger.info('training with file: %s' % data_file)
+        logger.info('training with batch size %d' % batch_size)
+        logger.info('training with %d words; validate with %d words during training; '
+                    'evaluate with %d words after training' % (train_nb_words, train_val_nb, val_nb_words))
+        logger.info('validate every %f seconds' % float(validation_interval))
+        logger.info('optimizer: %s' % opt_info)
+
+        log_file = LogInfo(log_file)
+        log_file.info('training with file: %s' % data_file)
+        log_file.info('training with batch size %d' % batch_size)
+        log_file.info('training with %d words; validate with %d words during training; '
+                      'evaluate with %d words after training' % (train_nb_words, train_val_nb, val_nb_words))
+        log_file.info('validate every %f seconds' % float(validation_interval))
+        log_file.info('optimizer: %s' % opt_info)
+
+        sentences = [None for _ in range(MAX_SETN_LEN)]  # TODO: sentences longer than 64 are ignored.
+
+        max_vocab = self.vocab_size - 1
+        nb_trained = 0.
+        nb_words_trained = 0.0
+        sent_gen = grouped_sentences(data_file)
+        val_sents = self.get_val_data(sent_gen, val_nb_words)
+        train_val_sents = self.get_val_data(sent_gen, train_val_nb)
+
+        self.validation(train_val_sents, batch_size, log_file)
+        start_ = time()
+        next_val_time = start_ + validation_interval
+        for sents in sent_gen:
+            mask = (sents > max_vocab)
+            sents[mask] = max_vocab
+            chunk = chunk_sentences(sentences, sents, batch_size)
+            if chunk is None:
+                continue
+
+            x = self.prepare_input(chunk)
+            loss = self._loop_train(x, batch_size)
+            nb_trained += chunk.shape[0]
+            nb_words_trained += chunk.size
+            end_ = time()
+            elapsed = float(end_ - start_)
+            speed1 = nb_trained/elapsed
+            speed2 = nb_words_trained/elapsed
+            eta = (train_nb_words - nb_words_trained) / speed2
+            eta_h = int(math.floor(eta/3600))
+            eta_m = int(math.ceil((eta - eta_h * 3600)/60.))
+            logger.info('%s:Train - ETA: %02d:%02d - loss: %5.3f - speed: %.1f sent/s %.1f words/s' %
+                        (self.__class__.__name__, eta_h, eta_m, loss, speed1, speed2))
+            log_file.info('%s:Train - time: %f - loss: %.6f' % (self.__class__.__name__, end_, loss))
+
+            if end_ > next_val_time:
+                # noinspection PyUnresolvedReferences
+                self.validation(train_val_sents, batch_size, log_file)
+                next_val_time = time() + validation_interval
+
+            if nb_words_trained >= train_nb_words:
+                break
+
+        logger.info('Training finished. Evaluating ...')
+        log_file.info('Training finished. Evaluating ...')
+        self.validation(val_sents, batch_size, log_file)
+        if save_path is not None:
+            self.save_params(save_path)
+        log_file.close()
+
+    def validation(self, val_sents, batch_size, log_file=None):
+        """
+        :param val_sents: validation sentences.
+        :type val_sents: a list, each element a ndarray
+        :return: tuple
+        """
+        code_len = 0.
+        nb_words = 0.
+        loss = 0.0
+
+        for sents in val_sents:
+            x = self.prepare_input(sents)
+            loss_, code_len_, nb_words_ = self._test_loop(self._test, x, batch_size)
+            nb_words += nb_words_
+            code_len += code_len_
+            loss += loss_ * nb_words_
+
+        loss /= nb_words
+        # try:
+        ppl = math.exp(code_len/nb_words)
+        # except OverflowError:
+        #     logger.error("code_len: %.3f - nb_words: %d" % (code_len, nb_words))
+        #     ppl = self.vocab_size * 1000
+        logger.info('%s:Val val_loss: %.2f - val_ppl: %.2f' % (self.__class__.__name__, loss, ppl))
+        log_file.info('%s:Val val_loss: %.6f - val_ppl: %.6f' % (self.__class__.__name__, loss, ppl))
+
+        return loss, ppl
+
+    def _loop_train(self, data, batch_size):
+        nb_words = data[0].shape[0]
+        loss = 0.0
+        batches = make_batches(nb_words, batch_size)
+        for start, end in batches:
+            X = data[0][start:end]
+            y = data[1][:, start:end]
+            p = data[2][:, start:end]
+            loss_ = self._train(X, y, p)
+            loss += loss_ * X.shape[0]
+
+        loss /= nb_words
+        return loss
+
+    @staticmethod
+    def _test_loop(f, ins, batch_size=128, verbose=0):
+        nb_sample = ins[0].shape[0]
+        outs = [[] for _ in range(f.n_returned_outputs)]
+        batch_info = []
+        batches = make_batches(nb_sample, batch_size)
+        for batch_index, (batch_start, batch_end) in enumerate(batches):
+            X = ins[0][batch_start:batch_end]
+            y = ins[1][:, batch_start:batch_end]
+            p = ins[2][:, batch_start:batch_end]
+            batch_outs = f(X, y, p)
+            for idx, v in enumerate(batch_outs):
+                outs[idx].append(v)
+            batch_info.append(X.shape[0])
+
+        outs = f.summarize_outputs(outs, batch_info)
+        return outs
+
+
+class FFNNLangModel(Graph, LangModel):
+    # the standard LBL language model with sparse coding extension, ZRegression
+    def __init__(self, sparse_coding, context_size, nb_negative, embed_dims=200, context_dims=200,
+                 init_embeddings=None, negprob_table=None, optimizer='adam'):
+        super(FFNNLangModel, self).__init__()
+        self.nb_negative = nb_negative
+        self.sparse_coding = sparse_coding
+        vocab_size = sparse_coding.shape[0]  # the extra word is for OOV
+        self.nb_base = sparse_coding.shape[1] - 1
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dims
+        # self.loss = categorical_crossentropy
+        # self.loss_fnc = objective_fnc(self.loss)
+        self.optimizer = optimizers.get(optimizer)
+        self.context_size = context_size
+        self.weights = None
+        # self.max_sent_len = max_sent_len
+        tmp1 = sparse.csr_matrix((self.vocab_size, context_size), dtype=floatX)
+        tmp2 = sparse.csr_matrix((context_size, self.nb_base+1), dtype=floatX)
+        tmp3 = sparse.vstack([tmp1, sparse.csr_matrix(np.eye(context_size, dtype=floatX))])
+        tmp4 = sparse.vstack([self.sparse_coding, tmp2])
+        self.sparse_coding_pad = sparse.hstack([tmp4, tmp3], format='csr')
+
+        if negprob_table is None:
+            negprob_table_ = np.ones(shape=(vocab_size,), dtype=theano.config.floatX)/vocab_size
+            self.neg_prob_table = negprob_table_
+        else:
+            self.neg_prob_table = negprob_table.astype(theano.config.floatX)
+
+        # self.sampler = TableSampler(self.neg_prob_table)
+
+        self.add_input(name='ngrams', ndim=2, dtype='int32')          # (ns, c), where c is the context size
+        self.add_input(name='label_with_neg', ndim=2, dtype='int32')  # (k+1, ns)
+        self.add_input(name='lookup_prob', ndim=2, dtype=floatX)      # (k+1, ns)
+
+        cntx_codes = tsp.csr_matrix('cntx-codes', dtype=floatX)
+        label_codes = tsp.csr_matrix('label_codes', dtype=floatX)
+        cntx_idxes = self.inputs['ngrams'].get_output()
+        # label_idxes = self.inputs['label_with_neg'].get_output()
+        batch_shape = cntx_idxes.shape
+
+        self.add_node(Identity(inputs={True: cntx_codes, False: cntx_codes}), name='cntx_codes_flat')
+        self.add_node(Identity(inputs={True: label_codes, False: label_codes}), name='label_codes_flat')
+        self.add_node(Identity(inputs={True: batch_shape, False: batch_shape}), name='cntx_shape')
+        # self.add_node(Identity(inputs={True: codes, False: codes}), name='sparse_codes')
+
+        self.add_node(SparseEmbedding(self.nb_base+self.context_size+1, embed_dims, weights=init_embeddings),
+                      name='embedding', inputs=('cntx_codes_flat', 'cntx_shape'))
+        self.add_node(EmbeddingParam(), name='embedding_param', inputs='embedding')
+        self.add_node(Reshape(-1), name='reshape', inputs='embedding')
+        self.add_node(Dense(context_size*embed_dims, context_dims), name='context_vec', inputs='reshape')
+        self.add_node(PartialSoftmaxFFNN(context_dims, base_size=self.nb_base+1),
+                      name='part_prob', inputs=('label_with_neg', 'label_codes_flat', 'context_vec'))
+        self.add_node(Dense(input_dim=context_dims, output_dim=1, activation='exponential'),
+                      name='normalizer', inputs='context_vec')
+        self.add_node(SharedWeightsDense(self.nodes['part_prob'].W,
+                                         self.nodes['part_prob'].b,
+                                         self.sparse_coding, activation='softmax'),
+                      name='true_prob', inputs='context_vec')
+
+        self.add_output('pos_prob', node='part_prob')
+        self.add_output('neg_prob', node='lookup_prob')
+        self.add_output('pred_prob', node='true_prob')
+        self.add_output('normalizer', node='normalizer')
+
+        self.fit = None
+        self.jobs_pools = None
+        self.jobs_pools_post = None
+        self.in_training_phase = Event()
+        self.trn_finished = Event()
+        self.all_finished = MEvent()
+
+    def __del__(self):
+        self.trn_finished.set()
+        self.all_finished.set()
+
+
+    @staticmethod
+    def encode_length(y_label, y_pred, mask=None):
+        """
+        :param y_label: true index labels with shape (ns, )
+        :param y_pred: predicted probabilities with shape (ns, V)
+        :param mask: mask
+        :return: PPL
+        """
+        ## there is no need to clip here, for the prob. have already clipped by LBLayer
+        # epsilon = 1e-7
+        # y_pred = T.clip(y_pred, epsilon, 1.0 - epsilon)
+        # # scale preds so that the class probas of each sample sum to 1
+        # y_pred /= y_pred.sum(axis=-1, keepdims=True)
+
+        nb_samples = y_label.shape[0]
+        idx = T.arange(nb_samples)
+        probs_ = y_pred[idx, y_label]
+
+        return -T.sum(T.log(probs_)), nb_samples
+
+    # noinspection PyMethodOverriding
+    def compile(self, optimizer=None):
+        # from theano.compile.nanguardmode import NanGuardMode
+        if optimizer is not None:
+            logger.info('compiling with %s' % optimizer)
+            self.optimizer = optimizers.get(optimizer)
+        # output of model
+        pos_prob_layer = self.outputs['pos_prob']
+        neg_prob_layer = self.outputs['neg_prob']
+        pre_prob_layer = self.outputs['pred_prob']
+        normlzer_layer = self.outputs['normalizer']
+
+        pos_prob_trn = pos_prob_layer.get_output(train=True)     # (k+1, ns)
+        neg_prob_trn = neg_prob_layer.get_output(train=True) * self.nb_negative
+        pos_prob_tst = pos_prob_layer.get_output(train=False)
+        neg_prob_tst = neg_prob_layer.get_output(train=False) * self.nb_negative
+        pre_prob_tst = pre_prob_layer.get_output(train=False)
+
+        nrm_const = normlzer_layer.get_output(train=True)        # (ns, 1)
+        nrm_const = T.reshape(nrm_const, (nrm_const.shape[0],))  # (ns, )
+        nrm_const = nrm_const.dimshuffle('x', 0)                 # (1, ns)
+        pos_prob_trn *= nrm_const
+
+        nrm_const_tst = normlzer_layer.get_output(train=False)
+        nrm_const_tst = T.reshape(nrm_const_tst, (nrm_const_tst.shape[0], ))
+        nrm_const_tst = nrm_const_tst.dimshuffle('x', 0)
+        pos_prob_tst *= nrm_const_tst
+
+        pre_prob_tst = T.clip(pre_prob_tst, epsilon, 1.-epsilon)
+        pre_prob_tst = pre_prob_tst / T.sum(pre_prob_tst, axis=-1, keepdims=True)
+
+        #TODO: mask not supported here
+        # eps = 1.0e-10
+        nb_words = pos_prob_trn[0].size.astype(floatX)
+        nb_words_ = pos_prob_tst[0].size.astype(floatX)
+        sum_pos_neg_trn = pos_prob_trn + neg_prob_trn
+        sum_pos_neg_tst = pos_prob_tst + neg_prob_tst
+        y_train = T.sum(T.log(T.clip(pos_prob_trn[0]/sum_pos_neg_trn[0], epsilon, 1.-epsilon))) / nb_words
+        y_train += T.sum(T.log(T.clip(neg_prob_trn[1:]/sum_pos_neg_trn[1:], epsilon, 1.-epsilon))) / nb_words
+        y_test = T.sum(T.log(T.clip(pos_prob_tst[0]/sum_pos_neg_tst[0], epsilon, 1.-epsilon))) / nb_words_
+        y_test += T.sum(T.log(T.clip(neg_prob_tst[1:] / sum_pos_neg_tst[1:], epsilon, 1.-epsilon))) / nb_words_
+
+        input0 = self.inputs['ngrams'].get_output(True)
+        input1 = self.inputs['label_with_neg'].get_output(True)
+        input2 = self.nodes['cntx_codes_flat'].get_output(True)
+        input3 = self.nodes['label_codes_flat'].get_output(True)
+        input4 = self.inputs['lookup_prob'].get_output(True)
+
+        true_labels = input1[0]
+        encode_len, nb_words = self.encode_length(true_labels, pre_prob_tst)
+
+        train_loss = -y_train
+        test_loss = -y_test
+        train_loss.name = 'train_loss'
+        test_loss.name = 'test_loss'
+
+        for r in self.regularizers:
+            train_loss = r(train_loss)
+        updates = self.optimizer.get_updates(self.params, self.constraints, train_loss)
+        updates += self.updates
+
+        train_ins = [input0, input1, input2, input3, input4]
+        test_ins = [input0, input1, input2, input3, input4]
+
+        self._train = theano.function(train_ins, train_loss, updates=updates)
+        self._train.out_labels = ['loss']
+        self._test = theano.function(test_ins, [test_loss, encode_len, nb_words])
+        self._test.out_labels = ['loss', 'encode_len', 'nb_words']
+
+        self.all_metrics = ['loss', 'ppl', 'val_loss', 'val_ppl']
+
+        def __summary_outputs(outs, batch_sizes):
+            out = np.array(outs, dtype=theano.config.floatX)
+            loss, encode_len, nb_words = out
+            batch_size = np.array(batch_sizes, dtype=theano.config.floatX)
+
+            smry_loss = np.sum(loss * batch_size)/batch_size.sum()
+            smry_encode_len = encode_len.sum()
+            smry_nb_words = nb_words.sum()
+            return [smry_loss, smry_encode_len, smry_nb_words]
+
+        self._train.summarize_outputs = __summary_outputs
+        self._test.summarize_outputs = __summary_outputs
+
+    def train(self, data_file='../data/corpus/wiki-sg-norm-lc-drop-bin-sample.bz2', save_path=None,
+              batch_size=256, train_nb_words=100000000, val_nb_words=100000, train_val_nb=100000,
+              validation_interval=1800, log_file=None, nb_data_workers=6, data_pool_size=10):
+        opt_info = self.optimizer.get_config()
+        opt_info = ', '.join(["{}: {}".format(n, v) for n, v in opt_info.items()])
+
+        logger.info('training with file: %s' % data_file)
+        logger.info('training with batch size %d' % batch_size)
+        logger.info('training with %d words; validate with %d words during training; '
+                    'evaluate with %d words after training' % (train_nb_words, train_val_nb, val_nb_words))
+        logger.info('validate every %f seconds' % float(validation_interval))
+        logger.info('optimizer: %s' % opt_info)
+
+        log_file = LogInfo(log_file)
+        log_file.info('training with file: %s' % data_file)
+        log_file.info('training with batch size %d' % batch_size)
+        log_file.info('training with %d words; validate with %d words during training; '
+                      'evaluate with %d words after training' % (train_nb_words, train_val_nb, val_nb_words))
+        log_file.info('validate every %f seconds' % float(validation_interval))
+        log_file.info('optimizer: %s' % opt_info)
+
+        sentences = [None for _ in range(MAX_SETN_LEN)]  # TODO: sentences longer than 64 are ignored.
+
+        max_vocab = self.vocab_size - 1
+        nb_words_trained = 0.0
+        sent_gen = grouped_sentences(data_file)
+        val_sents = self.get_val_data(sent_gen, val_nb_words)
+        train_val_sents = self.get_val_data(sent_gen, train_val_nb)
+
+        data_workers = []
+        pre_data = Queue(data_pool_size)
+        post_data = Queue(data_pool_size*30)
+        self.jobs_pools = pre_data
+        self.jobs_pools_post = post_data
+
+        xk = Array(ctypes.c_int32, np.arange(self.vocab_size, dtype='int32'), lock=False)
+        # a_type = ctypes.c_double if str(self.neg_prob_table.dtype) == 'float64' else ctypes.c_float
+        assert str(self.neg_prob_table.dtype) == 'float32'
+        pk = Array(ctypes.c_float, self.neg_prob_table, lock=False)
+
+        # a_type = ctypes.c_double if str(self.sparse_coding.dtype) == 'float64' else ctypes.c_float
+        assert str(self.sparse_coding.dtype) == 'float32'
+        sp_data = Array(ctypes.c_float, self.sparse_coding.data, lock=False)
+        assert str(self.sparse_coding.indices.dtype) == 'int32'
+        assert str(self.sparse_coding.indptr.dtype) == 'int32'
+        sp_indices = Array(ctypes.c_int32, self.sparse_coding.indices, lock=False)
+        sp_indptr = Array(ctypes.c_int32, self.sparse_coding.indptr, lock=False)
+
+        # a_type = ctypes.c_double if str(self.sparse_coding_pad.dtype) == 'float64' else ctypes.c_float
+        assert str(self.sparse_coding_pad.dtype) == 'float32'
+        sp_pad_data = Array(ctypes.c_float, self.sparse_coding_pad.data, lock=False)
+        assert str(self.sparse_coding_pad.indices.dtype) == 'int32'
+        assert str(self.sparse_coding_pad.indptr.dtype) == 'int32'
+        sp_pad_indices = Array(ctypes.c_int32, self.sparse_coding_pad.indices, lock=False)
+        sp_pad_indptr = Array(ctypes.c_int32, self.sparse_coding_pad.indptr, lock=False)
+
+        for _ in range(nb_data_workers):
+            # prepare_input(sents_queue, jobs_pool, all_finished,
+            #       vocab_size, context_size, batch_size, nb_negative, xk, pk,
+            #       sp_data, sp_indices, sp_indptr, sp_shape,
+            #       sp_pad_data, sp_pad_indices, sp_pad_inptr, sp_pad_shape):
+            p = Process(target=prepare_input, args=(pre_data, post_data, self.all_finished,
+                                                    self.vocab_size, self.context_size, batch_size, self.nb_negative,
+                                                    xk, pk, sp_data, sp_indices, sp_indptr, self.sparse_coding.shape,
+                                                    sp_pad_data, sp_pad_indices, sp_pad_indptr, self.sparse_coding_pad.shape))
+            p.daemon = True
+            data_workers.append(p)
+            p.start()
+
+        self.in_training_phase.clear()
+        self.validation(train_val_sents, log_file)
+
+        def chunk_trn_generator():
+            for sents in sent_gen:
+                if self.trn_finished.is_set():
+                    break
+
+                mask = (sents > max_vocab)
+                sents[mask] = max_vocab
+                chunk = chunk_sentences(sentences, sents, batch_size)
+                if chunk is None:
+                    continue
+                self.in_training_phase.wait()
+                pre_data.put(chunk)
+
+            self.trn_finished.set()
+            logger.debug('trn data finished')
+
+        gen_chunk_thread = Thread(target=chunk_trn_generator)
+        gen_chunk_thread.setDaemon(True)
+        gen_chunk_thread.start()
+
+        loss = 0.0
+        nb_chunk = 0.0
+        nb_cyc = 0
+        start_ = time()
+        next_val_time = start_ + validation_interval
+        self.in_training_phase.set()
+
+        while not self.trn_finished.is_set() or not post_data.empty():
+            ins = post_data.get()
+            # if ins is None:
+            #     if nb_none == nb_data_workers:
+            #         break
+            #     else:
+            #         nb_none += 1
+            #         continue
+            loss_ = self._train(*ins)
+            nb_cyc += 1
+            nb_cyc %= 20
+            nb_words_trained += ins[0].shape[0]
+            nb_chunk += ins[0].shape[0]
+            loss += loss_ * ins[0].shape[0]
+            if nb_cyc == 0:
+                end_ = time()
+                elapsed = float(end_ - start_)
+                speed2 = nb_words_trained/elapsed
+                eta = (train_nb_words - nb_words_trained) / speed2
+                eta_h = int(math.floor(eta/3600))
+                eta_m = int(math.ceil((eta - eta_h * 3600)/60.))
+                loss /= nb_chunk
+                logger.info('%s:Train - ETA: %02d:%02d - loss: %5.3f - speed: %.1f words/s' %
+                            (self.__class__.__name__, eta_h, eta_m, loss, speed2))
+                log_file.info('%s:Train - time: %f - loss: %.6f' % (self.__class__.__name__, end_, loss))
+                nb_chunk = 0.0
+                loss = 0.0
+
+                if end_ > next_val_time:
+                    logger.debug('pausing training data generation and consuming all generated data')
+                    self.in_training_phase.clear()
+                    while not self.jobs_pools_post.empty() or not self.jobs_pools.empty():
+                        ins = self.jobs_pools_post.get()
+                        self._train(*ins)
+                    logger.debug('Before validation')
+                    # noinspection PyUnresolvedReferences
+                    self.validation(train_val_sents, log_file)
+                    logger.debug('END validation. resume training data generation')
+                    self.in_training_phase.set()
+                    next_val_time = time() + validation_interval
+
+            if nb_words_trained >= train_nb_words:
+                self.trn_finished.set()
+                break
+
+        # consume all the produced tasks. The data generation thread will automatically shutdown, for the trn_finished
+        # event is set.
+        self.in_training_phase.set()  # make sure it is not blocking
+        while not self.jobs_pools_post.empty() or not self.jobs_pools.empty():
+            ins = self.jobs_pools_post.get()
+            self._train(*ins)
+
+        # Now the training data is consumed out. Let's evaluate...
+        logger.info('Training finished. Evaluating ...')
+        log_file.info('Training finished. Evaluating ...')
+        self.validation(val_sents, log_file)
+        self.all_finished.set()  # signal the all_finished event to shutdown all worker processes.
+        if save_path is not None:
+            self.save_params(save_path)
+        log_file.close()
+
+        for _ in range(10):
+            flags = map(Process.is_alive, data_workers)
+            if not any(flags):
+                break
+            for flag, p in zip(flags, data_workers):
+                if flag is True:
+                    logger.info("%s is alive" % p.name)
+            sleep(5)
+
+    def validation(self, val_sents, log_file=None):
+        """
+        :param val_sents: validation sentences.
+        :type val_sents: a list, each element a ndarray
+        :return: tuple
+        """
+        code_len = 0.
+        nb_words = 0.
+        loss = 0.0
+
+        def chunk_val_generator():
+            for sents in val_sents:
+                self.jobs_pools.put(sents)
+
+        gen_chunk_thread = Thread(target=chunk_val_generator)
+        gen_chunk_thread.setDaemon(True)
+        gen_chunk_thread.start()
+
+        logger.debug('begin val loop')
+        while True:
+            ins = self.jobs_pools_post.get()
+            loss_, code_len_, nb_words_ = self._test(*ins)
+            nb_words += nb_words_
+            code_len += code_len_
+            loss += loss_ * nb_words_
+            if self.jobs_pools_post.empty() and self.jobs_pools.empty():
+                break
+        logger.debug('end val loop')
+
+        loss /= nb_words
+        ppl = math.exp(code_len/nb_words)
+
+        logger.info('%s:Val val_loss: %.2f - val_ppl: %.2f' % (self.__class__.__name__, loss, ppl))
+        log_file.info('%s:Val val_loss: %.6f - val_ppl: %.6f' % (self.__class__.__name__, loss, ppl))
+
+        return loss, ppl
+
+
 def negative_sampleLBLV2(y, sampler, nb_negative):
         ret = np.empty(shape=(nb_negative+1,) + y.shape, dtype=y.dtype)
         ret[0] = y
@@ -3378,6 +4507,12 @@ def prepare_input(sents_queue, jobs_pool, all_finished,
     sp_pad_inptr = np.frombuffer(sp_pad_inptr, dtype='int32')
     sparse_coding = sparse.csr_matrix((sp_data, sp_indices, sp_indptr), shape=sp_shape)
     sparse_coding_pad = sparse.csr_matrix((sp_pad_data, sp_pad_indices, sp_pad_inptr), shape=sp_pad_shape)
+    logger.debug('sp:shape: %s, %s, len(pk): %d - sum(pk): %.2f - min(pk): %.2f' %
+                 (str(sparse_coding.shape), str(sparse_coding_pad.shape), len(pk), pk.sum(), pk.min()))
+    assert xk[0] == 0
+    sd = abs(int(np.frombuffer(os.urandom(4), dtype='int32')))
+    np.random.seed(sd)
+    logger.debug('seed: %d' % sd)
     custm = stats.rv_discrete(name='custm', values=(xk, pk))
 
     while not all_finished.is_set() or not sents_queue.empty():
@@ -3392,16 +4527,19 @@ def prepare_input(sents_queue, jobs_pool, all_finished,
             if batch_end <= batch_start:
                 break
 
-            X_ = X[batch_start:batch_end]
-            y_ = y_label[:, batch_start:batch_end]
+            X_ = X[batch_start:batch_end].copy()
+            y_ = y_label[:, batch_start:batch_end].copy()
             sp_x_ = sparse_coding_pad[X_.ravel()]
             sp_y_ = sparse_coding[y_.ravel()]
-            probs_ = probs[:, batch_start:batch_end]
+            probs_ = probs[:, batch_start:batch_end].copy()
 
             jobs_pool.put((X_, y_, sp_x_, sp_y_, probs_))
 
 if __name__ == '__main__':
-    from keras.optimizers import AdamAnneal
+    from keras.optimizers import rmsprop, AdamAnneal, adam, adadelta, sgd
+    from utils import get_unigram_probtable
+    logging.basicConfig(level=logging.DEBUG)
+    logger.setLevel(level=logging.DEBUG)
     # data_path = '../data/corpus/wiki-sg-norm-lc-drop-bin.bz2'
     # model = SimpleLangModel(vocab_size=10000, embed_dims=128, context_dims=128, optimizer='adam')
     # model.compile()
@@ -3414,39 +4552,46 @@ if __name__ == '__main__':
 
     # data_path = '../data/corpus/wiki-sg-norm-lc-drop-bin-sample.bz2'
     # # vocab_size, context_size, embed_dims=128, optimizer='adam'
-    # opt = AdamAnneal(lr=0.02, lr_min=0.001, gamma=0.03)
-    # model = LBLangModelV1(vocab_size=20000, context_size=5, embed_dims=200)
+    # opt = AdamAnneal(lr=0.001, lr_min=0.0001, gamma=0.03)
+    # nb_vocab = 20000
+    # unigram_table = get_unigram_probtable(nb_words=nb_vocab, save_path='../data/wiki-unigram-prob-size%d.pkl' % nb_vocab)
+    # model = LBLangModelV4(vocab_size=nb_vocab, context_size=5, embed_dims=200, negprob_table=unigram_table)
     # model.compile(opt)
     # # model.train_from_dir(data_fn=data_path, validation_split=0., batch_size=256, verbose=1)
     # model.train(data_file=data_path,
-    #             save_path='../data/models/lang/simple-lbl-e200-c200-lr0.01-lr_min0.001-gamma0.03-d-test.pkl',
     #             batch_size=512, train_nb_words=100000000,
-    #             val_nb_words=5000000, train_val_nb=100000,
-    #             log_file='../logs/simple-lbl-e200-c200-lr0.01-lr_min0.001-gamma0.03-d-test.log')
-    logging.basicConfig(level=logging.DEBUG)
-    logger.setLevel(level=logging.DEBUG)
+    #             val_nb_words=5000000, train_val_nb=100000)
+
     context_size = 5
     embed_dim = 200
     data_path = '../data/corpus/wiki-sg-norm-lc-drop-bin-sample.bz2'
-    opt = AdamAnneal(lr=0.008, lr_min=0.001, gamma=0.03)
+    # opt = AdamAnneal(lr=0.001, lr_min=0.000005, gamma=0.005)
+    opt = adam(lr=0.000001)
+    # opt = adadelta()
     with file('../data/sparse/sp-coding-10k-2k-g5e-3-a0.1-b0.1-t10-w1-0.1-10000.pkl', 'rb') as f:
         sp_coding = pickle.load(f)
     with file('../data/sparse/sp-embed-10k-2k-g5e-3-a0.1-b0.1-t10-w1-0.1-10000.pkl', 'rb') as f:
         embed = pickle.load(f)
 
+    nb_vocab = sp_coding.shape[0]
+    logger.debug('loading ../data/wiki-unigram-prob-size%d.pkl' % nb_vocab)
+    unigram_table = get_unigram_probtable(nb_words=nb_vocab, save_path='../data/wiki-unigram-prob-size%d.pkl' % nb_vocab)
+
     embed = np.vstack([embed, np.zeros((context_size, embed_dim))])
     # sparse_coding, context_size, nb_negative, embed_dims=200, init_embeddings=None,
     #             negprob_table=None, optimizer='adam'
-    model = LBLangModelV2(sparse_coding=sp_coding, context_size=context_size, embed_dims=embed_dim,
-                          nb_negative=50, init_embeddings=[embed])
+    model = LBLangModelV3(sparse_coding=sp_coding, context_size=context_size, embed_dims=embed_dim,
+                          nb_negative=10, init_embeddings=[embed])
+    # model = LBLangModelV4(vocab_size=10001, context_size=5, embed_dims=200, nb_negative=50, negprob_table=unigram_table)
     logger.debug('model constructed')
     model.compile(opt)
     logger.debug('model compiled')
     #model.train_from_dir(data_fn=data_path, validation_split=0., batch_size=256, verbose=1)
     model.train(data_file=data_path,
                 save_path='../data/models/lang/nce-lbl-e200-c200-lr0.01-lr_min0.001-gamma0.03-d-test.pkl',
-                batch_size=512, train_nb_words=1000000,
-                val_nb_words=50000, train_val_nb=1000,
-                validation_interval=60,
-                log_file='../logs/nce-lbl-e200-c200-lr0.01-lr_min0.001-gamma0.03-d-test.log')
+                batch_size=256, train_nb_words=50000000,
+                val_nb_words=500000, train_val_nb=30000,
+                validation_interval=200,
+                log_file='../logs/nce-lbl-e200-c200-lr0.01-lr_min0.001-gamma0.03-d-test.log',
+                nb_data_workers=1)
     #model.profile_model()

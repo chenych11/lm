@@ -1088,3 +1088,136 @@ class PartialSoftmaxLBL(MultiInputLayer):
         detectors = T.reshape(detectors_flat, detec_shape, ndim=idxes.ndim+1)   # (k+1, ns, dc)
         return T.exp(T.sum(detectors * features, axis=-1) + bias)               # (k+1, ns)
 
+
+class PartialSoftmaxLBLV4(Dense, MultiInputLayer):
+    def __init__(self, input_dim, output_dim, word_vecs, init='glorot_uniform', weights=None,
+                 name=None, b_regularizer=None, activity_regularizer=None, b_constraint=None):
+        MultiInputLayer.__init__(self, slot_names=['idxes', 'features'])
+
+        self.init = initializations.get(init)
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+
+        self.input = T.matrix()
+        # self.W = self.init((self.output_dim, self.input_dim))  # (V, dc)
+        self.W = word_vecs
+        self.b = shared_zeros(self.output_dim)                   # (V, )
+
+        self.params = [self.b]
+
+        self.regularizers = []
+
+        self.b_regularizer = regularizers.get(b_regularizer)
+        if self.b_regularizer:
+            self.b_regularizer.set_param(self.b)
+            self.regularizers.append(self.b_regularizer)
+
+        self.activity_regularizer = regularizers.get(activity_regularizer)
+        if self.activity_regularizer:
+            self.activity_regularizer.set_layer(self)
+            self.regularizers.append(self.activity_regularizer)
+
+        self.b_constraint = constraints.get(b_constraint)
+        self.constraints = [self.b_constraint]
+
+        if weights is not None:
+            self.set_weights(weights)
+
+        if name is not None:
+            self.set_name(name)
+
+        self.__input_slots = None
+
+    def get_input(self, train=False):
+        if self.__input_slots is None:
+            self.__input_slots = {True: dict((name, layer.get_output(True)) for name, layer in
+                                             zip(self.input_layer_names, self.input_layers)),
+                                  False: dict((name, layer.get_output(False)) for name, layer in
+                                              zip(self.input_layer_names, self.input_layers))}
+        return self.__input_slots[train]
+
+    def get_output(self, train=False):
+        ins = self.get_input(train)
+        idxes = ins['idxes']                                     # (k+1, ns)
+        features = ins['features']                               # (ns, dc)
+        weights = self.W.take(idxes, axis=0)                     # (k+1, ns, dc)
+        bias = self.b.take(idxes, axis=0)                        # (k+1, ns)
+        return T.exp(T.sum(weights * features, axis=-1) + bias)  # (k+1, ns)
+
+
+class SharedWeightsDenseLBLV4(Layer):
+    def __init__(self, W, b, activation='linear'):
+        super(SharedWeightsDenseLBLV4, self).__init__()
+        self.params = []
+        self.W = W  # (V, dc)
+        self.b = b  # (V, )
+        self.__input_slots = None
+        self.activation = activations.get(activation)
+
+    def get_output(self, train=False):
+        ins = self.get_input(train)  # (ns, dc)
+        return self.activation(T.dot(ins, self.W.T) + self.b)
+
+
+class PartialSoftmaxFFNN(Dense, MultiInputLayer):
+    def __init__(self, input_dim, base_size, init='glorot_uniform', weights=None, name=None,
+                 W_regularizer=None, b_regularizer=None, activity_regularizer=None,
+                 W_constraint=None, b_constraint=None):
+        MultiInputLayer.__init__(self, slot_names=['idxes', 'sparse_codings', 'features'])
+        self.init = initializations.get(init)
+        self.input_dim = input_dim
+        self.base_size = base_size
+
+        self.input = T.matrix()
+        self.W = self.init((base_size, input_dim))            # (B+1, dc)
+        self.b = shared_zeros((self.base_size, 1))            # (B+1, 1)
+
+        self.params = [self.W, self.b]
+
+        self.regularizers = []
+        self.W_regularizer = regularizers.get(W_regularizer)
+        if self.W_regularizer:
+            self.W_regularizer.set_param(self.W)
+            self.regularizers.append(self.W_regularizer)
+
+        self.b_regularizer = regularizers.get(b_regularizer)
+        if self.b_regularizer:
+            self.b_regularizer.set_param(self.b)
+            self.regularizers.append(self.b_regularizer)
+
+        self.activity_regularizer = regularizers.get(activity_regularizer)
+        if self.activity_regularizer:
+            self.activity_regularizer.set_layer(self)
+            self.regularizers.append(self.activity_regularizer)
+
+        self.W_constraint = constraints.get(W_constraint)
+        self.b_constraint = constraints.get(b_constraint)
+        self.constraints = [self.W_constraint, self.b_constraint]
+
+        if weights is not None:
+            self.set_weights(weights)
+
+        if name is not None:
+            self.set_name(name)
+
+        self.__input_slots = None
+
+    def get_input(self, train=False):
+        if self.__input_slots is None:
+            self.__input_slots = {True: dict((name, layer.get_output(True)) for name, layer in
+                                             zip(self.input_layer_names, self.input_layers)),
+                                  False: dict((name, layer.get_output(False)) for name, layer in
+                                              zip(self.input_layer_names, self.input_layers))}
+        return self.__input_slots[train]
+
+    def get_output(self, train=False):
+        ins = self.get_input(train)
+        idxes = ins['idxes']                                                    # (k+1, ns)
+        features = ins['features']                                              # (ns, dc)
+        sp_coding = ins['sparse_codings']                                       # (M, B+1)
+        detectors_flat = tsp.structured_dot(sp_coding, self.W)                  # (M, dc)
+        bias_flat = tsp.structured_dot(sp_coding, self.b)                       # (M, 1)
+        bias = T.reshape(bias_flat, idxes.shape, ndim=idxes.ndim)               # (k+1, ns)
+        detec_shape = T.concatenate([idxes.shape, [-1]])                        # = (k+1, ns, -1)
+        detectors = T.reshape(detectors_flat, detec_shape, ndim=idxes.ndim+1)   # (k+1, ns, dc)
+        return T.exp(T.sum(detectors * features, axis=-1) + bias)               # (k+1, ns)
