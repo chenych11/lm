@@ -3332,9 +3332,12 @@ class LBLangModelV2(Graph, LangModel):
 
 class LBLangModelV3(Graph, LangModel):
     # the standard LBL language model with sparse coding extension, ZRegression
-    def __init__(self, sparse_coding, context_size, nb_negative, embed_dims=200, init_embeddings=None,
-                 negprob_table=None, optimizer='adam'):
+    def __init__(self, sparse_coding, context_size, nb_negative, embed_dims=200, max_part_sum=0.7, alpha=1.0, beta=1.,
+                 init_embeddings=None, negprob_table=None, optimizer='adam'):
         super(LBLangModelV3, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.max_part_sum = max_part_sum
         self.nb_negative = nb_negative
         self.sparse_coding = sparse_coding
         vocab_size = sparse_coding.shape[0]  # the extra word is for OOV
@@ -3390,8 +3393,10 @@ class LBLangModelV3(Graph, LangModel):
         self.add_node(PartialSoftmaxLBL(base_size=self.nb_base+1,
                                         word_vecs=self.nodes['embedding'].W),
                       name='part_prob', inputs=('label_with_neg', 'label_codes_flat', 'context_vec'))
+        self.add_node(Dense(input_dim=embed_dims, output_dim=embed_dims, activation='sigmoid'),
+                      name='normalizer0', inputs='context_vec')
         self.add_node(Dense(input_dim=embed_dims, output_dim=1, activation='exponential'),
-                      name='normalizer', inputs='context_vec')
+                      name='normalizer', inputs='normalizer0')
         self.add_node(SharedWeightsDense(self.nodes['part_prob'].W,
                                          self.nodes['part_prob'].b,
                                          self.sparse_coding, activation='softmax'),
@@ -3475,6 +3480,21 @@ class LBLangModelV3(Graph, LangModel):
 
         nb_words = pos_prob_trn[0].size.astype(floatX)
         nb_words_ = pos_prob_tst[0].size.astype(floatX)
+
+        max_part_sum = self.max_part_sum
+        part_sum = T.sum(pos_prob_trn, axis=0)
+        tmp = T.switch(part_sum > max_part_sum, part_sum-max_part_sum, 0.0)
+        not_prob_loss = T.sum(tmp)/(T.nonzero(tmp)[0].size+1.0)
+
+        part_sum_tst = T.sum(pos_prob_tst, axis=0)
+        tmp = T.switch(part_sum_tst > max_part_sum, part_sum_tst-max_part_sum, 0.0)
+        not_prob_loss_tst = T.sum(tmp)/(T.nonzero(tmp)[0].size+1.0)
+
+        delta = 0.001
+        dif_pos_neg = pos_prob_trn[0] - T.sum(pos_prob_trn[1:], axis=0)/float(self.nb_negative)
+        dif_gain = dif_pos_neg - delta
+        dif_loss = T.sum(T.switch(dif_gain > 0.0, 0.0, -dif_gain))/nb_words
+
         # sum_pos_neg_trn = pos_prob_trn + neg_prob_trn
         # sum_pos_neg_tst = pos_prob_tst + neg_prob_tst
         # y_train = T.sum(T.log(T.clip(pos_prob_trn[0]/sum_pos_neg_trn[0], epsilon, 1.-epsilon))) / nb_words
@@ -3501,8 +3521,8 @@ class LBLangModelV3(Graph, LangModel):
         true_labels = input1[0]
         encode_len, nb_words = self.encode_length(true_labels, pre_prob_tst)
 
-        train_loss = -y_train
-        test_loss = -y_test
+        train_loss = -y_train + self.alpha*not_prob_loss + self.beta * dif_loss
+        test_loss = -y_test + self.alpha*not_prob_loss_tst
         train_loss.name = 'train_loss'
         test_loss.name = 'test_loss'
 
@@ -3514,7 +3534,7 @@ class LBLangModelV3(Graph, LangModel):
         train_ins = [input0, input1, input2, input3, input4]
         test_ins = [input0, input1, input2, input3, input4]
 
-        self._train = theano.function(train_ins, train_loss, updates=updates)
+        self._train = theano.function(train_ins, [train_loss, T.max(part_sum)], updates=updates)
         self._train.out_labels = ['loss']
         self._test = theano.function(test_ins, [test_loss, encode_len, nb_words])
         self._test.out_labels = ['loss', 'encode_len', 'nb_words']
@@ -3629,8 +3649,10 @@ class LBLangModelV3(Graph, LangModel):
         loss = 0.0
         nb_chunk = 0.0
         nb_cyc = 0
+        part_sum = 0.0
         start_ = time()
         next_val_time = start_ + validation_interval
+        next_report = start_ + 1.0
         self.in_training_phase.set()
 
         while not self.trn_finished.is_set() or not post_data.empty():
@@ -3641,31 +3663,36 @@ class LBLangModelV3(Graph, LangModel):
             #     else:
             #         nb_none += 1
             #         continue
-            loss_ = self._train(*ins)
+            loss_, part_sum_ = self._train(*ins)
             nb_cyc += 1
             nb_cyc %= 20
             nb_words_trained += ins[0].shape[0]
             nb_chunk += ins[0].shape[0]
             loss += loss_ * ins[0].shape[0]
+            part_sum = max(part_sum_, part_sum)
             if nb_cyc == 0:
                 end_ = time()
-                elapsed = float(end_ - start_)
-                speed2 = nb_words_trained/elapsed
-                eta = (train_nb_words - nb_words_trained) / speed2
-                eta_h = int(math.floor(eta/3600))
-                eta_m = int(math.ceil((eta - eta_h * 3600)/60.))
-                loss /= nb_chunk
-                logger.info('%s:Train - ETA: %02d:%02d - loss: %5.3f - speed: %.1f words/s' %
-                            (self.__class__.__name__, eta_h, eta_m, loss, speed2))
-                log_file.info('%s:Train - time: %f - loss: %.6f' % (self.__class__.__name__, end_, loss))
-                nb_chunk = 0.0
-                loss = 0.0
+                if end_ >= next_report:
+                    elapsed = float(end_ - start_)
+                    speed2 = nb_words_trained/elapsed
+                    eta = (train_nb_words - nb_words_trained) / speed2
+                    eta_h = int(math.floor(eta/3600))
+                    eta_m = int(math.ceil((eta - eta_h * 3600)/60.))
+                    loss /= nb_chunk
+                    logger.info('%s:Train - ETA: %02d:%02d - loss: %5.3f - part_sum: %.2f - speed: %.1f words/s' %
+                                (self.__class__.__name__, eta_h, eta_m, loss, part_sum, speed2))
+                    log_file.info('%s:Train - time: %f - loss: %.6f' % (self.__class__.__name__, end_, loss))
+                    nb_chunk = 0.0
+                    loss = 0.0
+                    part_sum = 0.0
+                    next_report = end_ + 1.0
 
                 if end_ > next_val_time:
                     logger.debug('pausing training data generation and consuming all generated data')
                     self.in_training_phase.clear()
                     while not self.jobs_pools_post.empty() or not self.jobs_pools.empty():
                         ins = self.jobs_pools_post.get()
+                        nb_words_trained += ins[0].shape[0]
                         self._train(*ins)
                     logger.debug('Before validation')
                     # noinspection PyUnresolvedReferences
@@ -4073,9 +4100,12 @@ class LBLangModelV4(Graph, LangModel):
 class FFNNLangModel(Graph, LangModel):
     # the standard LBL language model with sparse coding extension, ZRegression
     def __init__(self, sparse_coding, context_size, nb_negative, embed_dims=200, context_dims=200,
+                 max_part_sum=0.7, alpha=1.0,
                  init_embeddings=None, negprob_table=None, optimizer='adam'):
         super(FFNNLangModel, self).__init__()
         self.nb_negative = nb_negative
+        self.alpha = alpha
+        self.max_part_sum = max_part_sum
         self.sparse_coding = sparse_coding
         vocab_size = sparse_coding.shape[0]  # the extra word is for OOV
         self.nb_base = sparse_coding.shape[1] - 1
@@ -4123,8 +4153,10 @@ class FFNNLangModel(Graph, LangModel):
         self.add_node(Dense(context_size*embed_dims, context_dims), name='context_vec', inputs='reshape')
         self.add_node(PartialSoftmaxFFNN(context_dims, base_size=self.nb_base+1),
                       name='part_prob', inputs=('label_with_neg', 'label_codes_flat', 'context_vec'))
+        self.add_node(Dense(input_dim=context_dims, output_dim=context_dims, activation='sigmoid'),
+                      name='normalizer1', inputs='context_vec')
         self.add_node(Dense(input_dim=context_dims, output_dim=1, activation='exponential'),
-                      name='normalizer', inputs='context_vec')
+                      name='normalizer', inputs='normalizer1')
         self.add_node(SharedWeightsDense(self.nodes['part_prob'].W,
                                          self.nodes['part_prob'].b,
                                          self.sparse_coding, activation='softmax'),
@@ -4209,6 +4241,21 @@ class FFNNLangModel(Graph, LangModel):
         y_test = T.sum(T.log(T.clip(pos_prob_tst[0]/sum_pos_neg_tst[0], epsilon, 1.-epsilon))) / nb_words_
         y_test += T.sum(T.log(T.clip(neg_prob_tst[1:] / sum_pos_neg_tst[1:], epsilon, 1.-epsilon))) / nb_words_
 
+        # max_part_sum = self.max_part_sum
+        # part_sum = T.sum(pos_prob_trn, axis=0)
+        # tmp = T.switch(part_sum > max_part_sum, part_sum-max_part_sum, 0.0)
+        # not_prob_loss = T.sum(tmp)/(T.nonzero(tmp)[0].size+1.0)
+
+        not_prob_loss = T.sum(pos_prob_trn) / nb_words
+        # not_prob_loss = T.as_tensor_variable(0.0)
+
+        # part_sum_tst = T.sum(pos_prob_tst, axis=0)
+        # tmp = T.switch(part_sum_tst > max_part_sum, part_sum_tst-max_part_sum, 0.0)
+        # not_prob_loss_tst = T.sum(tmp)/(T.nonzero(tmp)[0].size+1.0)
+
+        not_prob_loss_tst = T.sum(pos_prob_tst) / nb_words_
+        # not_prob_loss_tst = T.as_tensor_variable(0.0)
+
         input0 = self.inputs['ngrams'].get_output(True)
         input1 = self.inputs['label_with_neg'].get_output(True)
         input2 = self.nodes['cntx_codes_flat'].get_output(True)
@@ -4218,8 +4265,8 @@ class FFNNLangModel(Graph, LangModel):
         true_labels = input1[0]
         encode_len, nb_words = self.encode_length(true_labels, pre_prob_tst)
 
-        train_loss = -y_train
-        test_loss = -y_test
+        train_loss = -y_train + self.alpha * not_prob_loss
+        test_loss = -y_test + self.alpha * not_prob_loss_tst
         train_loss.name = 'train_loss'
         test_loss.name = 'test_loss'
 
@@ -4231,7 +4278,7 @@ class FFNNLangModel(Graph, LangModel):
         train_ins = [input0, input1, input2, input3, input4]
         test_ins = [input0, input1, input2, input3, input4]
 
-        self._train = theano.function(train_ins, train_loss, updates=updates)
+        self._train = theano.function(train_ins, [train_loss, not_prob_loss], updates=updates)
         self._train.out_labels = ['loss']
         self._test = theano.function(test_ins, [test_loss, encode_len, nb_words])
         self._test.out_labels = ['loss', 'encode_len', 'nb_words']
@@ -4330,7 +4377,7 @@ class FFNNLangModel(Graph, LangModel):
 
                 mask = (sents > max_vocab)
                 sents[mask] = max_vocab
-                chunk = chunk_sentences(sentences, sents, batch_size)
+                chunk = chunk_sentences(sentences, sents, int(batch_size//10))
                 if chunk is None:
                     continue
                 self.in_training_phase.wait()
@@ -4346,8 +4393,10 @@ class FFNNLangModel(Graph, LangModel):
         loss = 0.0
         nb_chunk = 0.0
         nb_cyc = 0
+        part_sum = 0.0
         start_ = time()
         next_val_time = start_ + validation_interval
+        next_report = start_ + 1.0
         self.in_training_phase.set()
 
         while not self.trn_finished.is_set() or not post_data.empty():
@@ -4358,25 +4407,29 @@ class FFNNLangModel(Graph, LangModel):
             #     else:
             #         nb_none += 1
             #         continue
-            loss_ = self._train(*ins)
+            loss_, part_sum_ = self._train(*ins)
             nb_cyc += 1
             nb_cyc %= 20
             nb_words_trained += ins[0].shape[0]
             nb_chunk += ins[0].shape[0]
             loss += loss_ * ins[0].shape[0]
+            part_sum = max(part_sum, part_sum_)
             if nb_cyc == 0:
                 end_ = time()
-                elapsed = float(end_ - start_)
-                speed2 = nb_words_trained/elapsed
-                eta = (train_nb_words - nb_words_trained) / speed2
-                eta_h = int(math.floor(eta/3600))
-                eta_m = int(math.ceil((eta - eta_h * 3600)/60.))
-                loss /= nb_chunk
-                logger.info('%s:Train - ETA: %02d:%02d - loss: %5.3f - speed: %.1f words/s' %
-                            (self.__class__.__name__, eta_h, eta_m, loss, speed2))
-                log_file.info('%s:Train - time: %f - loss: %.6f' % (self.__class__.__name__, end_, loss))
-                nb_chunk = 0.0
-                loss = 0.0
+                if end_ > next_report:
+                    elapsed = float(end_ - start_)
+                    speed2 = nb_words_trained/elapsed
+                    eta = (train_nb_words - nb_words_trained) / speed2
+                    eta_h = int(math.floor(eta/3600))
+                    eta_m = int(math.ceil((eta - eta_h * 3600)/60.))
+                    loss /= nb_chunk
+                    logger.info('%s:Train - ETA: %02d:%02d - loss: %5.3f - mean_prob: %.2e - speed: %.1f words/s' %
+                                (self.__class__.__name__, eta_h, eta_m, loss, part_sum, speed2))
+                    log_file.info('%s:Train - time: %f - loss: %.6f' % (self.__class__.__name__, end_, loss))
+                    nb_chunk = 0.0
+                    loss = 0.0
+                    next_report = end_ + 1.0
+                    part_sum = 0.0
 
                 if end_ > next_val_time:
                     logger.debug('pausing training data generation and consuming all generated data')
@@ -4384,6 +4437,7 @@ class FFNNLangModel(Graph, LangModel):
                     while not self.jobs_pools_post.empty() or not self.jobs_pools.empty():
                         ins = self.jobs_pools_post.get()
                         self._train(*ins)
+                        nb_words_trained += ins[0].shape[0]
                     logger.debug('Before validation')
                     # noinspection PyUnresolvedReferences
                     self.validation(train_val_sents, log_file)
@@ -4565,33 +4619,39 @@ if __name__ == '__main__':
     context_size = 5
     embed_dim = 200
     data_path = '../data/corpus/wiki-sg-norm-lc-drop-bin-sample.bz2'
-    # opt = AdamAnneal(lr=0.001, lr_min=0.000005, gamma=0.005)
-    opt = adam(lr=0.000001)
+    # opt = AdamAnneal(lr=0.005, lr_min=0.001, gamma=0.0005)
+    opt = adam(lr=0.001)
+    # opt.clipnorm = 100.0
     # opt = adadelta()
-    with file('../data/sparse/sp-coding-10k-2k-g5e-3-a0.1-b0.1-t10-w1-0.1-10000.pkl', 'rb') as f:
-        sp_coding = pickle.load(f)
-    with file('../data/sparse/sp-embed-10k-2k-g5e-3-a0.1-b0.1-t10-w1-0.1-10000.pkl', 'rb') as f:
-        embed = pickle.load(f)
 
-    nb_vocab = sp_coding.shape[0]
-    logger.debug('loading ../data/wiki-unigram-prob-size%d.pkl' % nb_vocab)
+    with file('../data/sparse/total-app-a0.1-b0.1-w1-0.1-15000.pkl', 'rb') as f:
+        sparse_coding = pickle.load(f)
+        # print sparse_coding.dtype
+
+    nb_vocab = 50000
+    sparse_coding = sparse_coding[nb_vocab//1000]
+    nb_vocab, nb_base = sparse_coding.shape
+    nb_base -= 1
     unigram_table = get_unigram_probtable(nb_words=nb_vocab, save_path='../data/wiki-unigram-prob-size%d.pkl' % nb_vocab)
 
-    embed = np.vstack([embed, np.zeros((context_size, embed_dim))])
     # sparse_coding, context_size, nb_negative, embed_dims=200, init_embeddings=None,
     #             negprob_table=None, optimizer='adam'
-    model = LBLangModelV3(sparse_coding=sp_coding, context_size=context_size, embed_dims=embed_dim,
-                          nb_negative=10, init_embeddings=[embed])
+    model = FFNNLangModel(sparse_coding=sparse_coding,
+                          context_size=context_size,
+                          max_part_sum=0.01, alpha=10,
+                          embed_dims=embed_dim,
+                          nb_negative=20,
+                          init_embeddings=None)
     # model = LBLangModelV4(vocab_size=10001, context_size=5, embed_dims=200, nb_negative=50, negprob_table=unigram_table)
     logger.debug('model constructed')
     model.compile(opt)
     logger.debug('model compiled')
     #model.train_from_dir(data_fn=data_path, validation_split=0., batch_size=256, verbose=1)
     model.train(data_file=data_path,
-                save_path='../data/models/lang/nce-lbl-e200-c200-lr0.01-lr_min0.001-gamma0.03-d-test.pkl',
-                batch_size=256, train_nb_words=50000000,
+                # save_path='../data/models/lang/ffnn-lbl-e200-c200-lr0.01-lr_min0.001-gamma0.03-d-test.pkl',
+                batch_size=3096, train_nb_words=100000000,
                 val_nb_words=500000, train_val_nb=30000,
-                validation_interval=200,
-                log_file='../logs/nce-lbl-e200-c200-lr0.01-lr_min0.001-gamma0.03-d-test.log',
-                nb_data_workers=1)
+                validation_interval=180,
+                log_file='../logs/nce-ffnn-alpha5-e200-c200-lr0.01-lr_min0.001-gamma0.03-d-test.log',
+                nb_data_workers=2)
     #model.profile_model()
