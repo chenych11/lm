@@ -1547,7 +1547,7 @@ class LBLayer(Layer):
 
         W = np.empty(shape=(context_size, embed_dim, embed_dim), dtype=floatX)
         for i in range(context_size):
-            W[i] = self.init((embed_dim, embed_dim), 'cpu').get_value(borrow=True)
+            W[i] = self.init((embed_dim, embed_dim), device='tmp').get_value(borrow=True)
         self.W = theano.shared(W, name='cntx_w', borrow=True)
         self.pad = theano.shared(np.zeros((1, self.context_size, self.context_size, self.embed_dim), dtype=floatX),
                                  borrow=True)
@@ -1985,7 +1985,7 @@ class LBLScoreV1(MultiInputLayer):
     def get_output(self, train=False):
         ins = self.get_input(train)
         cntxt_vec = ins['context']
-        wrd_vec = ins['word'].dimshuffle(0, 1, 'x')
+        wrd_vec = ins['word'][:self.vocab_size].dimshuffle(0, 1, 'x')
         prob_ = T.exp(T.dot(cntxt_vec, wrd_vec) + self.b)
         prob_ = T.addbroadcast(prob_, 2)
         prob_ = prob_.dimshuffle(0, 1)
