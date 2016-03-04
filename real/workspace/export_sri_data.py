@@ -13,4 +13,7 @@ DATA_ROOT = '../../data/'
 
 for k in range(10000, 52000, 2000):
     data4sri(src_corpus=DATA_ROOT+'/corpus/wiki-sg-norm-lc-drop-bin.bz2', save_path=DATA_ROOT+'corpus/sri',
-         train_nb_words=100000000, val_nb_words=5000000, train_val_nb=100000, max_vocab=k)
+             train_nb_words=100000000, val_nb_words=5000000, train_val_nb=100000, max_vocab=k)
+
+data4sri(src_corpus=DATA_ROOT+'/corpus/wiki-sg-norm-lc-drop-bin.bz2', save_path=DATA_ROOT+'corpus/sri',
+         train_nb_words=100000000, val_nb_words=5000000, train_val_nb=100000, max_vocab=100000000)
