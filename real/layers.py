@@ -737,6 +737,43 @@ class PartialSoftmaxV7(Dense, MultiInputLayer):
         # return T.exp(T.sum(detectors * features, axis=-1))
 
 
+class PartialSoftmaxV8(Dense, MultiInputLayer):
+    def __init__(self, input_dim, base_size, init='glorot_uniform', weights=None, name=None,
+                 W_regularizer=None, b_regularizer=None, activity_regularizer=None,
+                 W_constraint=None, b_constraint=None):
+        MultiInputLayer.__init__(self, slot_names=['idxes', 'sparse_codings', 'features'])
+        Dense.__init__(self, base_size, input_dim, init=init, weights=weights, name=name, W_regularizer=W_regularizer,
+                       b_regularizer=b_regularizer, activity_regularizer=activity_regularizer,
+                       W_constraint=W_constraint, b_constraint=b_constraint)
+        self.params.remove(self.b)
+        self.b = shared_zeros((base_size+1, ), dtype=float_t)
+        self.params.append(self.b)
+        self.base_size = base_size
+
+        self.__input_slots = None
+
+    def get_input(self, train=False):
+        if self.__input_slots is None:
+            self.__input_slots = {True: dict((name, layer.get_output(True)) for name, layer in
+                                             zip(self.input_layer_names, self.input_layers)),
+                                  False: dict((name, layer.get_output(False)) for name, layer in
+                                              zip(self.input_layer_names, self.input_layers))}
+        return self.__input_slots[train]
+
+    def get_output(self, train=False):
+        ins = self.get_input(train)
+        idxes = ins['idxes']
+        sparse_codings = ins['sparse_codings']                        # (M, B+1)
+        features = ins['features']                                    # (ns, nt, dl)
+        detectors_flat = tsp.structured_dot(sparse_codings, self.W)   # (M, dl)
+        detec_shape = T.concatenate([idxes.shape, [-1]])
+        detectors = T.reshape(detectors_flat, detec_shape, ndim=idxes.ndim+1)   # (ns, nt, dl)
+        exceed_idxes = (idxes > self.base_size).nonzero()
+        bias_idxes = T.set_subtensor(idxes[exceed_idxes], self.base_size)
+        bias = self.b[bias_idxes]
+        return T.exp(T.sum(detectors * features, axis=-1) + bias)
+
+
 class SharedWeightsDense(Layer):
     def __init__(self, W, b, sparse_codes, activation='linear'):
         super(SharedWeightsDense, self).__init__()
@@ -770,6 +807,26 @@ class SharedWeightsDenseV7(Layer):
         W = tsp.structured_dot(self.sparse_codes, self.W).T
         b = self.b
         return self.activation(T.dot(ins, W) + b)
+
+
+class SharedWeightsDenseV8(Layer):
+    def __init__(self, W, b, sparse_codes, activation='linear'):
+        super(SharedWeightsDenseV8, self).__init__()
+        self.params = []
+        self.W = W  # (B+1, dl)
+        self.vocab_size = sparse_codes.shape[0]
+        tmp_b = np.zeros((self.vocab_size,), dtype=float_t)
+        b_value = b.get_value(borrow=True)
+        tmp_b[:b_value.shape[0]] = b_value
+        self.b = theano.shared(tmp_b, borrow=True)
+        self.__input_slots = None
+        self.sparse_codes = tsp.as_sparse_variable(sparse_codes)
+        self.activation = activations.get(activation)
+
+    def get_output(self, train=False):
+        ins = self.get_input(train)
+        W = tsp.structured_dot(self.sparse_codes, self.W).T
+        return self.activation(T.dot(ins, W) + self.b)
 
 
 class LookupProb(Layer):
