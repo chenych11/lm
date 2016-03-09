@@ -5,7 +5,7 @@ else
     command_prefix=
 fi
 
-export PYTHONPATH="${PWD}/../../lm:${PYTHONPATH}"
+export PYTHONPATH="${PWD}/../..:${PYTHONPATH}"
 export OMP_NUM_THREADS=2
 export MKL_NUM_THREADS=2
 
